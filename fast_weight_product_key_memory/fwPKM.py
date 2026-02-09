@@ -4,6 +4,7 @@ from math import sqrt
 import torch
 from torch import nn, cdist
 from torch import tensor, Tensor
+import torch.nn.functional as F
 from torch.nn import Module, Sequential, RMSNorm
 
 import einx
@@ -26,8 +27,14 @@ def LinearNoBias(dim, dim_out):
 def log(t, eps = 1e-20):
     return t.clamp_min(eps).log()
 
+def l1norm(t, dim = -1, eps = 1e-10):
+    return F.normalize(t, dim = -1, p = 1, eps = eps)
+
 def entropy(prob):
     return -(prob * log(prob)).sum(dim = -1)
+
+def z_score(t, dim = -1, eps = 1e-10):
+    return (t - t.mean(dim = -1, keepdim = True)) / t.std(dim = -1, keepdim = True).clamp_min(eps)
 
 def inverse_distance_weight(q, k, eps = 1e-3):
     dist = cdist(q, k) ** 2
@@ -100,9 +107,9 @@ class fwPKM(Module):
         self,
         tokens,
         return_store_grads = False,
-        return_aux_loss = False
+        return_addressing_loss = False
     ):
-        k = self.topk
+        k, num_keys = self.topk, self.num_keys
 
         q1, q2 = self.to_queries(tokens)
         k1, k2 = self.keys
@@ -120,7 +127,7 @@ class fwPKM(Module):
 
         # merge
 
-        indices = einx.add('... i, ... j -> ... (i j)', indices1 * self.num_keys, indices2)
+        indices = einx.add('... i, ... j -> ... (i j)', indices1 * num_keys, indices2)
         scores = einx.add('... i, ... j -> ... (i j)', top1, top2)
 
         # topk again
@@ -140,9 +147,35 @@ class fwPKM(Module):
 
         target_values = self.to_values(tokens)
 
+        target_values = z_score(target_values) # they apparently z-scored the target values for stability
+
         output = target_values.lerp(values, gates)
 
         out = self.to_out(output)
+
+        # handle addressing loss
+
+        if return_addressing_loss:
+            key1_indices = (final_indices // num_keys).flatten()
+            key2_indices = (final_indices % num_keys).flatten()
+
+            final_scores = final_scores.flatten()
+
+            zeros = torch.zeros(num_keys, device = self.device)
+
+            acc_scores_key1 = zeros.scatter_add(0, key1_indices, final_scores)
+            acc_scores_key2 = zeros.scatter_add(0, key2_indices, final_scores)
+
+            probs1 = l1norm(acc_scores_key1)
+            probs2 = l1norm(acc_scores_key2)
+
+            addressing_loss = -(entropy(probs1) + entropy(probs2)).mean()
+
+            loss = addressing_loss * self.addressing_loss_weight
+
+            out = (out, loss)
+
+        # early return if not storing
 
         if not return_store_grads:
             return out
@@ -160,15 +193,10 @@ class fwPKM(Module):
 
         memories_grad = einx.multiply('... d, ... topk -> (... topk) d', error, final_scores)
 
-        flattened_final_indices = rearrange(final_indices, '... -> (...)')
+        flattened_final_indices = final_indices.flatten()
 
         final_indices_expanded = repeat(flattened_final_indices, '... -> (...) d', d = memories_grad.shape[-1])
 
         fast_weight_memories = torch.zeros_like(self.memories).scatter_reduce_(0, final_indices_expanded, memories_grad, reduce = 'mean', include_self = False)
 
-        if not return_aux_loss:
-            return out, fast_weight_memories
-
-        addressing_loss = self.zero
-
-        return out, fast_weight_memories, addressing_loss
+        return out, fast_weight_memories

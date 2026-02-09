@@ -9,6 +9,7 @@ def test_memory():
     pkm = fwPKM(512)
 
     tokens = torch.randn(2, 256, 512)
-    out = pkm(tokens)
+    out, addressing_loss = pkm(tokens, return_addressing_loss = True)
 
     assert tokens.shape == out.shape
+    assert addressing_loss.numel() == 1
