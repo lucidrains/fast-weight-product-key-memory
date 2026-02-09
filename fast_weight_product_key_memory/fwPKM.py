@@ -7,7 +7,7 @@ from torch import tensor, Tensor
 from torch.nn import Module, Sequential, RMSNorm
 
 import einx
-from einops import rearrange, einsum
+from einops import rearrange, einsum, repeat
 from einops.layers.torch import Rearrange
 
 # functions
@@ -45,7 +45,6 @@ class fwPKM(Module):
         dim_values = 512,
         learning_rate = 1.,
         topk = 8,
-        lookahead_values = True,
         addressing_loss_weight = 10.
     ):
         super().__init__()
@@ -61,6 +60,7 @@ class fwPKM(Module):
         self.keys = nn.Parameter(torch.randn(2, num_keys, dim_queries_keys) * 1e-2)
 
         self.num_keys = num_keys
+        self.num_memories = num_memories
 
         # projections
 
@@ -87,15 +87,18 @@ class fwPKM(Module):
 
         # storing related
 
-        self.lookahead_values = lookahead_values
-
         self.addressing_loss_weight = addressing_loss_weight
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
+    @property
+    def device(self):
+        return self.zero.device
+
     def forward(
         self,
         tokens,
+        return_store_grads = False,
         return_aux_loss = False
     ):
         k = self.topk
@@ -109,7 +112,7 @@ class fwPKM(Module):
 
         dist1, dist2 = inverse_distance_weight(q1, k1), inverse_distance_weight(q2, k2)
 
-        # get the topk closest euclidean distance
+        # get the topk closest by idw
 
         top1, indices1 = dist1.topk(k = k)
         top2, indices2 = dist2.topk(k = k)
@@ -124,7 +127,7 @@ class fwPKM(Module):
         top_scores, top_sub_indices = scores.topk(k = k)
 
         final_indices = indices.gather(-1, top_sub_indices)
-        final_scores = top_scores.softmax(dim = -1) # iirc, Czordas showed competitive is better, so offer that at some point
+        final_scores = top_scores.softmax(dim = -1)
 
         memories = self.memories[final_indices]
 
@@ -138,4 +141,33 @@ class fwPKM(Module):
 
         output = target_values.lerp(values, gates)
 
-        return self.to_out(output)
+        out = self.to_out(output)
+
+        if not return_store_grads:
+            return out
+
+        # calculating fast weights for episodic memory
+        # with lookahead
+
+        final_indices = final_indices[..., :-1, :]
+        final_scores = final_scores[..., :-1, :]
+        gates = gates[..., :-1, :]
+
+        error = gates * (values[:, :-1] - target_values[:, 1:]) # mse loss with lookahead
+
+        # get update for memories
+
+        memories_grad = einx.multiply('... d, ... topk -> (... topk) d', error, final_scores)
+
+        flattened_final_indices = rearrange(final_indices, '... -> (...)')
+
+        final_indices_expanded = repeat(flattened_final_indices, '... -> (...) d', d = memories_grad.shape[-1])
+
+        fast_weight_memories = torch.zeros_like(self.memories).scatter_reduce_(0, final_indices_expanded, memories_grad, reduce = 'mean', include_self = False)
+
+        if not return_aux_loss:
+            return out, fast_weight_memories
+
+        addressing_loss = self.zero
+
+        return out, fast_weight_memories, addressing_loss
