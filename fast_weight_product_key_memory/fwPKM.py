@@ -2,7 +2,7 @@ from __future__ import annotations
 from math import sqrt
 
 import torch
-from torch import nn
+from torch import nn, cdist
 from torch import tensor, Tensor
 from torch.nn import Module, Sequential, RMSNorm
 
@@ -29,6 +29,10 @@ def log(t, eps = 1e-20):
 def entropy(prob):
     return -(prob * log(prob)).sum(dim = -1)
 
+def inverse_distance_weight(q, k, eps = 1e-3):
+    dist = cdist(q, k) ** 2
+    return -log(dist, eps = eps)
+
 # classes
 
 class fwPKM(Module):
@@ -47,14 +51,16 @@ class fwPKM(Module):
         super().__init__()
         assert sqrt(num_memories).is_integer(), 'num memories must have an integer square root'
 
-        self.memories = nn.Parameter(torch.randn(num_memories, dim_values) * 1e-2)
+        self.memories = nn.Parameter(torch.randn(num_memories, dim_values))
 
         # pkm related
 
         self.topk = topk
 
         num_keys = int(sqrt(num_memories))
-        self.keys = nn.Parameter(torch.randn(2, num_keys, dim_queries_keys))
+        self.keys = nn.Parameter(torch.randn(2, num_keys, dim_queries_keys) * 1e-2)
+
+        self.num_keys = num_keys
 
         # projections
 
@@ -79,7 +85,9 @@ class fwPKM(Module):
             LinearNoBias(dim_values, dim)
         )
 
-        # loss related
+        # storing related
+
+        self.lookahead_values = lookahead_values
 
         self.addressing_loss_weight = addressing_loss_weight
 
@@ -90,12 +98,44 @@ class fwPKM(Module):
         tokens,
         return_aux_loss = False
     ):
+        k = self.topk
 
         q1, q2 = self.to_queries(tokens)
         k1, k2 = self.keys
 
-        target_values = self.to_values(tokens)
+        # product keys
+
+        # they use a special type of distance from a paper i've seen in the past by a lone author - https://arxiv.org/abs/2310.18805
+
+        dist1, dist2 = inverse_distance_weight(q1, k1), inverse_distance_weight(q2, k2)
+
+        # get the topk closest euclidean distance
+
+        top1, indices1 = dist1.topk(k = k)
+        top2, indices2 = dist2.topk(k = k)
+
+        # merge
+
+        indices = einx.add('... i, ... j -> ... (i j)', indices1 * self.num_keys, indices2)
+        scores = einx.add('... i, ... j -> ... (i j)', top1, top2)
+
+        # topk again
+
+        top_scores, top_sub_indices = scores.topk(k = k)
+
+        final_indices = indices.gather(-1, top_sub_indices)
+        final_scores = top_scores.softmax(dim = -1) # iirc, Czordas showed competitive is better, so offer that at some point
+
+        memories = self.memories[final_indices]
+
+        values = einsum(memories, final_scores, '... topk d, ... topk -> ... d')
+
+        # gates and values
 
         gates = self.to_gates(tokens)
 
-        return self.to_out(target_values)
+        target_values = self.to_values(tokens)
+
+        output = target_values.lerp(values, gates)
+
+        return self.to_out(output)
