@@ -72,7 +72,8 @@ class fwPKM(Module):
 
         self.to_gates = Sequential(
             RMSNorm(dim),
-            LinearNoBias(dim, 1)
+            LinearNoBias(dim, 1),
+            nn.Sigmoid()
         )
 
         self.to_values = Sequential(
