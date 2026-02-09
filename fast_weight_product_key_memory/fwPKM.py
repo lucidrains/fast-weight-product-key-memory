@@ -1,5 +1,10 @@
+from __future__ import annotations
+
 import torch
-from torch.nn import Module, ModuleList
+from torch.nn import Module, ModuleList, RMSNorm
+
+import einx
+from einops import rearrange
 
 # functions
 
@@ -14,6 +19,13 @@ def default(v, d):
 class fwPKM(Module):
     def __init__(
         self,
+        dim,
+        *,
+        dim_qk = 512,
+        dim_v = 512,
+        learning_rate = 1.,
+        topk = 8,
+        lookahead_values = True
     ):
         super().__init__()
 
