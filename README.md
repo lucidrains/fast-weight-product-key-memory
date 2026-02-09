@@ -1,8 +1,42 @@
 <img src="./fig1.png" width="400px"></img>
 
-## Fast Weight Product Key Memory (wip)
+## Fast Weight Product Key Memory
 
-Implementation of the [fast weight product key memory](https://arxiv.org/abs/2601.00671) from Sakana AI
+Implementation of the [Fast Weight Product Key Memory](https://arxiv.org/abs/2601.00671) proposed by Sakana AI
+
+## Install
+
+```bash
+$ pip install fast-weight-product-key-memory
+```
+
+## Usage
+
+```python
+import torch
+from fast_weight_product_key_memory import fwPKM
+
+mem = fwPKM(
+    dim = 512,
+    num_memories = 256 * 256,
+    dim_queries_keys = 512,
+    dim_values = 512,
+    topk = 8,
+    learning_rate = 1.
+)
+
+tokens = torch.randn(2, 1024, 512)
+
+# forward a chunk of tokens for retrieved and the fast weight episodic memories
+
+retrieved, next_memories = mem(tokens, return_next_memories = True)
+
+# chain memories
+
+retrieved, next_memories = mem(tokens, return_next_memories = True, past_memories = next_memories)
+retrieved, next_memories = mem(tokens, return_next_memories = True, past_memories = next_memories)
+retrieved, next_memories = mem(tokens, return_next_memories = True, past_memories = next_memories)
+```
 
 ## Citations
 
