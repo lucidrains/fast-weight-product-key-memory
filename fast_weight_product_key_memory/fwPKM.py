@@ -7,7 +7,7 @@ from torch import tensor, Tensor
 from torch.nn import Module, Sequential, RMSNorm
 
 import einx
-from einops import rearrange
+from einops import rearrange, einsum
 from einops.layers.torch import Rearrange
 
 # functions
@@ -49,6 +49,10 @@ class fwPKM(Module):
 
         self.memories = nn.Parameter(torch.randn(num_memories, dim_values) * 1e-2)
 
+        # pkm related
+
+        self.topk = topk
+
         num_keys = int(sqrt(num_memories))
         self.keys = nn.Parameter(torch.randn(2, num_keys, dim_queries_keys))
 
@@ -83,7 +87,15 @@ class fwPKM(Module):
 
     def forward(
         self,
-        tokens
+        tokens,
+        return_aux_loss = False
     ):
 
-        return tokens
+        q1, q2 = self.to_queries(tokens)
+        k1, k2 = self.keys
+
+        target_values = self.to_values(tokens)
+
+        gates = self.to_gates(tokens)
+
+        return self.to_out(target_values)
