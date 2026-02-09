@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import namedtuple
 from math import sqrt
 
 import torch
@@ -10,6 +11,10 @@ from torch.nn import Module, Sequential, RMSNorm
 import einx
 from einops import rearrange, einsum, repeat
 from einops.layers.torch import Rearrange
+
+# constants
+
+Memories = namedtuple('Memories', ('memory_values', 'keys'))
 
 # functions
 
@@ -95,6 +100,8 @@ class fwPKM(Module):
 
         # storing related
 
+        self.learning_rate = learning_rate
+
         self.addressing_loss_weight = addressing_loss_weight
 
         self.register_buffer('zero', tensor(0.), persistent = False)
@@ -106,8 +113,9 @@ class fwPKM(Module):
     def forward(
         self,
         tokens,
-        return_store_grads = False,
-        return_addressing_loss = False
+        return_next_memories = False,
+        return_addressing_loss = False,
+        past_memories: Memories | None = None
     ):
         k, num_keys = self.topk, self.num_keys
 
@@ -139,6 +147,12 @@ class fwPKM(Module):
 
         memories = self.memories[final_indices]
 
+        # add the past memories
+
+        if exists(past_memories):
+            past_fast_weight_memories = past_memories.memory_values[final_indices]
+            memories = memories + past_fast_weight_memories
+
         values = einsum(memories, final_scores, '... topk d, ... topk -> ... d')
 
         # gates and values
@@ -159,12 +173,12 @@ class fwPKM(Module):
             key1_indices = (final_indices // num_keys).flatten()
             key2_indices = (final_indices % num_keys).flatten()
 
-            final_scores = final_scores.flatten()
+            flattened_final_scores = final_scores.flatten()
 
             zeros = torch.zeros(num_keys, device = self.device)
 
-            acc_scores_key1 = zeros.scatter_add(0, key1_indices, final_scores)
-            acc_scores_key2 = zeros.scatter_add(0, key2_indices, final_scores)
+            acc_scores_key1 = zeros.scatter_add(0, key1_indices, flattened_final_scores)
+            acc_scores_key2 = zeros.scatter_add(0, key2_indices, flattened_final_scores)
 
             probs1 = l1norm(acc_scores_key1)
             probs2 = l1norm(acc_scores_key2)
@@ -177,17 +191,18 @@ class fwPKM(Module):
 
         # early return if not storing
 
-        if not return_store_grads:
+        if not return_next_memories:
             return out
 
         # calculating fast weights for episodic memory
         # with lookahead
 
         final_indices = final_indices[..., :-1, :]
+
         final_scores = final_scores[..., :-1, :]
         gates = gates[..., :-1, :]
 
-        error = gates * (values[:, :-1] - target_values[:, 1:]) # mse loss with lookahead
+        error = gates * (values[:, :-1] - target_values[:, 1:]) * self.learning_rate # mse loss with lookahead
 
         # get update for memories
 
@@ -197,6 +212,11 @@ class fwPKM(Module):
 
         final_indices_expanded = repeat(flattened_final_indices, '... -> (...) d', d = memories_grad.shape[-1])
 
-        fast_weight_memories = torch.zeros_like(self.memories).scatter_reduce_(0, final_indices_expanded, memories_grad, reduce = 'mean', include_self = False)
+        next_fast_weight_memories = torch.zeros_like(self.memories).scatter_reduce_(0, final_indices_expanded, memories_grad, reduce = 'mean', include_self = False)
 
-        return out, fast_weight_memories
+        # accumulate the new stored memories with the old
+
+        if exists(past_memories):
+            next_fast_weight_memories = next_fast_weight_memories + past_fast_weight_memories
+
+        return out, Memories(next_fast_weight_memories, None)
