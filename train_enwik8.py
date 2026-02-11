@@ -110,10 +110,11 @@ class Transformer(Module):
         depth,
         local_attn_window_size = 256,
         neural_memory_layers: tuple[int, ...] | None = None,
-        neural_memory_kwargs: dict = dict()
+        neural_memory_kwargs: dict | None = None
     ):
         super().__init__()
         neural_memory_layers = default(neural_memory_layers, ())
+        neural_memory_kwargs = default(neural_memory_kwargs, dict())
 
         self.token_emb = nn.Embedding(num_tokens, dim)
         self.to_logits = nn.Linear(dim, num_tokens, bias = False)
@@ -223,7 +224,14 @@ def train(
     dim = 512,
     depth = 6,
     local_attn_window_size = 256,
-    neural_memory_layers = (2, 4)
+    neural_memory_layers = (2, 4),
+    num_memories = 512 * 512,
+    dim_queries_keys = 512,
+    dim_values = 512,
+    learning_rate_pkm = 1.,
+    topk = 8,
+    addressing_loss_weight = 10.,
+    chunk_size = 256
 ):
     # accelerator
 
@@ -238,7 +246,16 @@ def train(
         max_seq_len = seq_len,
         depth = depth,
         local_attn_window_size = local_attn_window_size,
-        neural_memory_layers = neural_memory_layers
+        neural_memory_layers = neural_memory_layers,
+        neural_memory_kwargs = dict(
+            num_memories = num_memories,
+            dim_queries_keys = dim_queries_keys,
+            dim_values = dim_values,
+            learning_rate = learning_rate_pkm,
+            topk = topk,
+            addressing_loss_weight = addressing_loss_weight,
+            chunk_size = chunk_size
+        )
     )
 
     # prepare enwik8 data
