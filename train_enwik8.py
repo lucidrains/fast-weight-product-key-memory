@@ -1,14 +1,14 @@
 # /// script
 # dependencies = [
+#   "fire",
 #   "torch",
 #   "numpy",
 #   "tqdm",
 #   "einops",
-#   "local-attention",
-#   "accelerate",
+#   "x-transformers",
+#   "discrete-continuous-embed-readout",
 #   "fast-weight-product-key-memory",
-#   "fire",
-#   "discrete-continuous-embed-readout"
+#   "accelerate",
 # ]
 # ///
 
@@ -24,16 +24,18 @@ import numpy as np
 import torch
 from torch.optim import Adam
 from torch import nn, Tensor
-from torch.nn import Module, ModuleList, RMSNorm
+from torch.nn import Module, ModuleList
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from accelerate import Accelerator
-from local_attention import LocalAttention, LocalMHA
-from local_attention.transformer import FeedForward
+from x_transformers.x_transformers import Attention, FeedForward, RotaryEmbedding, RMSNorm
+from x_transformers.attend import Intermediates as AttentionIntermediates
+
 from einops import rearrange, repeat, einsum
 
 from discrete_continuous_embed_readout import EmbedAndReadout
+
+from accelerate import Accelerator
 
 from fast_weight_product_key_memory import fwPKM
 
@@ -90,8 +92,6 @@ def base_decoding(
             filter_kwargs = dict(thres = filter_thres)
         )
 
-        sampled_token = rearrange(sampled_token, 'b ... -> b (...)')
-
         out = torch.cat((out, sampled_token), dim = -1)
 
     return out[..., prompt_seq_len:]
@@ -104,9 +104,9 @@ class Transformer(Module):
         *,
         num_tokens,
         dim,
-        max_seq_len,
         depth,
-        local_attn_window_size = 256,
+        heads = 8,
+        dim_head = 64,
         neural_memory_layers: tuple[int, ...] | None = None,
         neural_memory_kwargs: dict | None = None
     ):
@@ -116,22 +116,23 @@ class Transformer(Module):
 
         self.embed, self.readout = EmbedAndReadout(
             dim = dim,
-            num_discrete = num_tokens,
-            weight_tie = False
+            num_discrete = num_tokens
         )
 
-        self.pos_emb = nn.Embedding(max_seq_len, dim)
+        self.rotary_emb = RotaryEmbedding(dim = dim_head)
 
         self.layers = ModuleList([])
 
         for i in range(depth):
-            layer_idx = i + 1
+            layer = i + 1
 
-            maybe_neural_memory = fwPKM(dim = dim, **neural_memory_kwargs) if layer_idx in neural_memory_layers else None
+            maybe_neural_memory = fwPKM(dim = dim, **neural_memory_kwargs) if layer in neural_memory_layers else None
 
             self.layers.append(ModuleList([
+                RMSNorm(dim),
                 maybe_neural_memory,
-                LocalMHA(dim = dim, window_size = local_attn_window_size, prenorm = True, causal = True, use_rotary_pos_emb = False),
+                Attention(dim = dim, heads = heads, dim_head = dim_head, causal = True),
+                RMSNorm(dim),
                 FeedForward(dim = dim)
             ]))
 
@@ -141,34 +142,40 @@ class Transformer(Module):
 
     def forward(
         self,
-        x,
+        tokens,
         return_loss = False,
         return_cache = False,
         cache = None
     ):
         if return_loss:
-            x, labels = x[:, :-1], x[:, 1:]
+            tokens, labels = tokens[:, :-1], tokens[:, 1:]
+
+        # cache related logic
 
         has_cache = exists(cache)
+        layer_caches = iter([])
+        new_layer_caches = []
+        offset = 0
 
         if has_cache:
-            x = x[:, -1:]
-            layer_caches, offset = cache
-        else:
-            layer_caches = []
-            offset = 0
+            tokens = tokens[:, -1:]
+            past_layer_caches, offset = cache
+            layer_caches = iter(past_layer_caches)
 
-        n, device = x.shape[1], x.device
+        # variables
 
-        x = self.embed(x)
-        x = x + self.pos_emb(torch.arange(n, device = device) + offset)
+        seq_len, device = tokens.shape[1], tokens.device
+
+        x = self.embed(tokens)
+        rotary_pos_emb = self.rotary_emb(torch.arange(seq_len + offset, device = device))
+
+        # loss
 
         total_addressing_loss = self.zero
 
-        new_layer_caches = []
-        layer_caches = iter(default(layer_caches, []))
+        # layers
 
-        for neural_memory, attn, ff in self.layers:
+        for attn_norm, neural_memory, attn, ff_norm, ff in self.layers:
             nm_cache, attn_cache = next(layer_caches, (None, None))
 
             next_nm_cache = nm_cache
@@ -186,28 +193,37 @@ class Transformer(Module):
                 x = x + neural_memory_out
                 total_addressing_loss = total_addressing_loss + addressing_loss.mean()
 
-            attn_out, next_attn_cache = attn(
-                x,
-                cache = attn_cache,
-                return_cache = True
+            attn_out, attn_intermediates = attn(
+                attn_norm(x),
+                cache = AttentionIntermediates(cached_kv = attn_cache) if exists(attn_cache) else None,
+                rotary_pos_emb = rotary_pos_emb,
+                return_intermediates = True
             )
 
+            next_attn_cache = attn_intermediates.cached_kv
+
             x = attn_out + x
-            x = ff(x) + x
+            x = ff(ff_norm(x)) + x
 
             new_layer_caches.append((next_nm_cache, next_attn_cache))
 
-        x = self.norm(x)
+        # embed
+
+        embed = self.norm(x)
+
+        # early return logits
 
         if not return_loss:
-            logits = self.readout(x)
+            logits = self.readout(embed)
 
             if not return_cache:
                 return logits
 
-            return logits, (new_layer_caches, offset + n)
+            return logits, (new_layer_caches, offset + seq_len)
 
-        loss = self.readout(x, labels, return_loss = True)
+        # loss
+
+        loss = self.readout(embed, labels, return_loss = True)
 
         return loss + total_addressing_loss, (loss, total_addressing_loss)
 
@@ -224,15 +240,16 @@ def train(
     seq_len = 512,
     prime_length = 128,
     dim = 512,
+    dim_head = 64,
+    heads = 8,
     depth = 6,
-    local_attn_window_size = 256,
     neural_memory_layers = (2, 4),
     num_memories = 512 * 512,
     dim_queries_keys = 512,
     dim_values = 512,
     learning_rate_pkm = 1.,
     topk = 8,
-    addressing_loss_weight = 10.,
+    addressing_loss_weight = 5.,
     chunk_size = 256
 ):
     # accelerator
@@ -245,9 +262,9 @@ def train(
     model = Transformer(
         num_tokens = 256,
         dim = dim,
-        max_seq_len = seq_len,
         depth = depth,
-        local_attn_window_size = local_attn_window_size,
+        heads = heads,
+        dim_head = dim_head,
         neural_memory_layers = neural_memory_layers,
         neural_memory_kwargs = dict(
             num_memories = num_memories,
