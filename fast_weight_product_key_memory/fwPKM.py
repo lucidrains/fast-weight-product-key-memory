@@ -365,7 +365,7 @@ class fwPKM(Module):
                     idw_eps = idw_eps
                 )
 
-                mv, mk = self.store(s_inter, past_memories = past_mem, idw_eps = idw_eps)
+                mv, mk = self.store(s_inter, past_memories = past_mem, detach_next_memories = detach_next_memories, idw_eps = idw_eps)
                 past_mem = past_mem._replace(memory_values = mv, keys = mk, cached_tokens = None, num_cached = 0)
 
             # retrieve outputs
