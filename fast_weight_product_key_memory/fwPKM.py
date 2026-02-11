@@ -1,10 +1,10 @@
 from __future__ import annotations
-from collections import namedtuple
+from typing import NamedTuple
 from math import sqrt
 from functools import partial
 
 import torch
-from torch import nn, stack, cdist
+from torch import nn, stack, cat, cdist
 from torch import tensor, Tensor
 import torch.nn.functional as F
 from torch.nn import Module, Sequential, RMSNorm
@@ -13,11 +13,17 @@ import einx
 from einops import rearrange, einsum, repeat, reduce
 from einops.layers.torch import Rearrange
 
-from torch_einops_utils import shape_with_replace
+from torch_einops_utils import shape_with_replace, safe_cat
 
 # constants
 
-Memories = namedtuple('Memories', ('memory_values', 'keys'))
+class Memories(NamedTuple):
+    memory_values: Tensor
+    keys: Tensor
+    last_token: Tensor | None = None
+    cached_tokens: Tensor | None = None
+    token_count: int = 0
+    num_cached: int = 0
 
 # functions
 
@@ -26,6 +32,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def is_greater_than_zero(n):
+    return n > 0
 
 def LinearNoBias(dim, dim_out):
     return nn.Linear(dim, dim_out, bias = False)
@@ -44,6 +53,18 @@ def entropy(prob):
 def z_score(t, dim = -1, eps = 1e-10):
     return (t - t.mean(dim = -1, keepdim = True)) / t.std(dim = -1, keepdim = True).clamp_min(eps)
 
+def remove_last_token(t):
+    return t[:, :-1]
+
+def remove_first_token(t):
+    return t[:, 1:]
+
+def get_first_token(t):
+    return t[:, :1]
+
+def get_last_token(t):
+    return t[:, -1:]
+
 # classes
 
 class fwPKM(Module):
@@ -51,6 +72,7 @@ class fwPKM(Module):
         self,
         dim,
         *,
+        chunk_size = 256,
         num_memories = 512 * 512,
         dim_queries_keys = 512,
         dim_values = 512,
@@ -103,19 +125,40 @@ class fwPKM(Module):
 
         self.addressing_loss_weight = addressing_loss_weight
 
-        self.register_buffer('zero', tensor(0.), persistent = False)
+        self.chunk_size = chunk_size
+
+        self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
     @property
     def device(self):
         return self.zero.device
 
-    def forward(
+    @property
+    def init_memories(self):
+        return Memories(torch.zeros_like(self.memories), torch.zeros_like(self.keys))
+
+    def calculate_addressing_loss(
+        self,
+        indices,
+        scores
+    ):
+        num_keys = self.num_keys
+        key_indices = stack((indices // num_keys, indices % num_keys))
+        key_indices = rearrange(key_indices, 'two ... -> two (...)')
+        scores = repeat(scores.flatten(), '... -> two ...', two = 2)
+
+        zeros = torch.zeros(2, num_keys, device = self.device)
+        acc_scores = zeros.scatter_add(1, key_indices, scores)
+
+        probs = l1norm(acc_scores, dim = -1)
+
+        addressing_loss = entropy(probs).sum() / indices.shape[1]
+        return addressing_loss * self.addressing_loss_weight
+
+    def retrieve(
         self,
         tokens,
-        return_next_memories = False,
-        return_addressing_loss = False,
         past_memories: Memories | None = None,
-        detach_next_memories = False,
         idw_eps = 1e-3
     ):
         k, num_keys = self.topk, self.num_keys
@@ -130,8 +173,6 @@ class fwPKM(Module):
             keys = keys + past_memories.keys
 
         k1, k2 = keys
-
-        # they use a special type of distance from a paper i've seen in the past by a lone author - https://arxiv.org/abs/2310.18805
 
         dist1 = cdist(q1, k1) ** 2
         dist2 = cdist(q2, k2) ** 2
@@ -171,85 +212,78 @@ class fwPKM(Module):
 
         target_values = self.to_values(tokens)
 
-        target_values = z_score(target_values) # they apparently z-scored the target values for stability
+        target_values = z_score(target_values)
 
         output = target_values.lerp(values, gates)
 
         out = self.to_out(output)
 
-        # handle addressing loss
+        # return everything needed for store
 
-        if return_addressing_loss:
-            key1_indices = (final_indices // num_keys).flatten()
-            key2_indices = (final_indices % num_keys).flatten()
+        intermediates = dict(
+            q1 = q1,
+            q2 = q2,
+            dist1 = dist1,
+            dist2 = dist2,
+            indices1 = indices1,
+            indices2 = indices2,
+            scores = scores,
+            top_sub_indices = top_sub_indices,
+            final_indices = final_indices,
+            final_scores = final_scores,
+            gates = gates,
+            target_values = target_values,
+            values = values,
+            memories = memories,
+            k1 = k1,
+            k2 = k2
+        )
 
-            flattened_final_scores = final_scores.flatten()
+        return out, intermediates
 
-            zeros = torch.zeros(num_keys, device = self.device)
+    def store(
+        self,
+        intermediates: dict,
+        past_memories: Memories | None = None,
+        detach_next_memories = False,
+        idw_eps = 1e-3
+    ):
+        k, num_keys = self.topk, self.num_keys
 
-            acc_scores_key1 = zeros.scatter_add(0, key1_indices, flattened_final_scores)
-            acc_scores_key2 = zeros.scatter_add(0, key2_indices, flattened_final_scores)
+        (
+            q1, q2,
+            final_indices, final_scores,
+            gates, values, memories,
+            indices1, indices2, top_sub_indices,
+            dist1, dist2
+        ) = [remove_last_token(intermediates[key]) for key in (
+            'q1', 'q2',
+            'final_indices', 'final_scores',
+            'gates', 'values', 'memories',
+            'indices1', 'indices2', 'top_sub_indices',
+            'dist1', 'dist2'
+        )]
 
-            probs1 = l1norm(acc_scores_key1)
-            probs2 = l1norm(acc_scores_key2)
+        target_values = remove_first_token(intermediates['target_values'])
 
-            addressing_loss = -(entropy(probs1) + entropy(probs2)).mean()
-
-            loss = addressing_loss * self.addressing_loss_weight
-
-            out = (out, loss)
-
-        # early return if not storing
-
-        if not return_next_memories:
-            return out
-
-        # calculating fast weights for episodic memory
-        # with lookahead
-
-        # remove last token for a bunch of variables for easy reading
-
-        q1, q2 = q1[:, :-1], q2[:, :-1]
-        dist1, dist2 = dist1[:, :-1], dist2[:, :-1]
-
-        indices1, indices2 = indices1[:, :-1], indices2[:, :-1]
-
-        scores = scores[:, :-1]
-        top_sub_indices = top_sub_indices[:, :-1]
-        final_indices = final_indices[:, :-1]
-        final_scores = final_scores[:, :-1]
-
-        gates = gates[:, :-1]
-        target_values = target_values[:, 1:]
-        values = values[:, :-1]
-        memories = memories[:, :-1]
-
-        # mse loss with lookahead
+        # MSE loss with lookahead
 
         error = gates * (values - target_values) * self.learning_rate
-
-        # get update for memories
 
         memories_grad = einx.multiply('... d, ... topk -> (... topk) d', error, final_scores)
 
         flattened_final_indices = final_indices.flatten()
-
         final_indices_expanded = repeat(flattened_final_indices, '... -> (...) d', d = memories_grad.shape[-1])
 
         next_fast_weight_memories = torch.zeros_like(self.memories).scatter_reduce_(0, final_indices_expanded, memories_grad, reduce = 'mean', include_self = False)
 
-        # step through the softmax backwards and torwards the idw
-
         final_scores_grad = einsum(error, memories, '... d, ... topk d -> ... topk')
-
         top_scores_grad = final_scores * (final_scores_grad - (final_scores * final_scores_grad).sum(dim = -1, keepdim = True))
 
         # now propagate top_scores_grad back to the keys
 
         sub_indices1 = top_sub_indices // k
         sub_indices2 = top_sub_indices % k
-
-        # 2. back to dist1 and dist2
 
         final_indices1 = indices1.gather(-1, sub_indices1)
         final_indices2 = indices2.gather(-1, sub_indices2)
@@ -259,31 +293,16 @@ class fwPKM(Module):
         dist1_grad = torch.zeros(grad_shape, device = self.device).scatter_add_(-1, final_indices1, top_scores_grad)
         dist2_grad = torch.zeros(grad_shape, device = self.device).scatter_add_(-1, final_indices2, top_scores_grad)
 
-        # gemini flash helped me out with the backwards through idw below
-
-        # 3. back through idw: dist = -log(cdist^2) -> d_dist = -1/cdist^2 * d_cdist^2
-
         def get_keys_grad(q, k, d_sq, dist_grad):
-            # dist = cdist(q, k) ** 2
-            # return -log(dist, eps = idw_eps)
-
             cdist_sq_grad = -dist_grad / (d_sq + idw_eps)
-
-            # d_cdist_sq / d_k = -2 * (q - k)
-
             diff = einx.subtract('... d, m d -> ... m d', q, k)
             grad = -2 * einx.multiply('... m, ... m d', cdist_sq_grad, diff)
-
             return reduce(grad, '... m d -> m d', 'sum')
 
-        # stack the grads for key1 and key2 as the fast weight memories
-
         next_fast_weight_keys = stack((
-            get_keys_grad(q1, k1, dist1, dist1_grad),
-            get_keys_grad(q2, k2, dist2, dist2_grad)
+            get_keys_grad(q1, intermediates['k1'], dist1, dist1_grad),
+            get_keys_grad(q2, intermediates['k2'], dist2, dist2_grad)
         ))
-
-        # accumulate the new stored memories with the old
 
         if exists(past_memories):
             next_fast_weight_memories = next_fast_weight_memories + past_memories.memory_values
@@ -293,4 +312,77 @@ class fwPKM(Module):
             next_fast_weight_memories = next_fast_weight_memories.detach()
             next_fast_weight_keys = next_fast_weight_keys.detach()
 
-        return out, Memories(next_fast_weight_memories, next_fast_weight_keys)
+        return next_fast_weight_memories, next_fast_weight_keys
+
+    def forward(
+        self,
+        tokens,
+        return_next_memories = False,
+        return_addressing_loss = False,
+        past_memories: Memories | None = None,
+        detach_next_memories = False,
+        idw_eps = 1e-3
+    ):
+        past_mem = default(past_memories, self.init_memories)
+        num_tokens, count, chunk_size = tokens.shape[1], past_mem.token_count, self.chunk_size
+
+        # calc segments reaching chunk boundaries
+
+        to_bound = chunk_size - (count % chunk_size)
+        rem = max(0, num_tokens - to_bound)
+        split_sizes = (min(num_tokens, to_bound), *([chunk_size] * (rem // chunk_size)), rem % chunk_size)
+        segments = tokens.split(list(filter(is_greater_than_zero, split_sizes)), dim = 1)
+
+        out_list, total_loss = [], 0.
+
+        for segment in segments:
+            # potential chunked store across boundary
+
+            if past_mem.num_cached == chunk_size:
+                _, s_inter = self.retrieve(
+                    cat((past_mem.cached_tokens, get_first_token(segment)), dim = 1),
+                    past_memories = past_mem,
+                    idw_eps = idw_eps
+                )
+
+                mv, mk = self.store(s_inter, past_memories = past_mem, idw_eps = idw_eps)
+                past_mem = past_mem._replace(memory_values = mv, keys = mk, cached_tokens = None, num_cached = 0)
+
+            # retrieve outputs
+
+            out, inter = self.retrieve(
+                safe_cat((past_mem.last_token, segment), dim = 1),
+                past_memories = past_mem,
+                idw_eps = idw_eps
+            )
+
+            # update state
+
+            mv, mk = past_mem.memory_values, past_mem.keys
+
+            # handle causal chaining and slicing
+
+            indices, scores, slen = inter['final_indices'], inter['final_scores'], segment.shape[1]
+
+            if exists(past_mem.last_token):
+                out, indices, scores = [remove_first_token(t) for t in (out, indices, scores)]
+
+            cached = safe_cat((past_mem.cached_tokens, segment), dim = 1)
+            past_mem = Memories(mv, mk, get_last_token(segment), cached, past_mem.token_count + slen, past_mem.num_cached + slen)
+
+            out_list.append(out)
+            total_loss = total_loss + self.calculate_addressing_loss(indices, scores) * slen
+
+        # finalize next memories
+
+        if detach_next_memories:
+            past_mem = past_mem._replace(
+                memory_values = past_mem.memory_values.detach(),
+                keys = past_mem.keys.detach()
+            )
+
+        # finalize return
+
+        out = cat(out_list, dim = 1)
+        res = (out, total_loss / num_tokens) if return_addressing_loss else out
+        return (res, past_mem) if return_next_memories else res
