@@ -39,6 +39,14 @@ retrieved, next_memories = mem(tokens, return_next_memories = True, past_memorie
 retrieved, next_memories = mem(tokens, return_next_memories = True, past_memories = next_memories)
 ```
 
+## Enwik8
+
+Character-level language model with `fwPKM`
+
+```shell
+$ uv run train_enwik8.py
+```
+
 ## Citations
 
 ```bibtex
