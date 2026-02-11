@@ -185,21 +185,35 @@ class fwPKM(Module):
 
         score1, score2 = -log(dist1, eps = idw_eps), -log(dist2, eps = idw_eps)
 
-        # get the topk closest by idw
+        # get the topk closest - using negative distance for stable selection
 
-        top1, indices1 = score1.topk(k = k)
-        top2, indices2 = score2.topk(k = k)
+        _, indices1 = (-dist1).topk(k = k)
+        _, indices2 = (-dist2).topk(k = k)
+
+        top1 = score1.gather(-1, indices1)
+        top2 = score2.gather(-1, indices2)
+
+        scores = einx.add('... i, ... j -> ... (i j)', top1, top2)
 
         # product keys
 
         indices = einx.add('... i, ... j -> ... (i j)', indices1 * num_keys, indices2)
-        scores = einx.add('... i, ... j -> ... (i j)', top1, top2)
 
-        # topk again
+        # for stable product selection, we rank by -( (dist1 + eps) * (dist2 + eps) )
+        # which is equivalent to ranking by log sums but numerically robust
 
-        top_scores, top_sub_indices = scores.topk(k = k)
+        s1 = (dist1 + idw_eps).gather(-1, indices1)
+        s2 = (dist2 + idw_eps).gather(-1, indices2)
+        prod_dist = einx.multiply('... i, ... j -> ... (i j)', s1, s2)
 
-        final_indices = indices.gather(-1, top_sub_indices)
+        _, sub_indices = (-prod_dist).topk(k = k)
+
+        final_indices = indices.gather(-1, sub_indices)
+
+        # scores are reconstructed from the log-scores of the winners
+
+        top_scores = scores.gather(-1, sub_indices)
+
         final_scores = top_scores.softmax(dim = -1)
 
         memories = self.memories[final_indices]
@@ -234,7 +248,7 @@ class fwPKM(Module):
             indices1 = indices1,
             indices2 = indices2,
             scores = scores,
-            top_sub_indices = top_sub_indices,
+            sub_indices = sub_indices,
             final_indices = final_indices,
             final_scores = final_scores,
             gates = gates,
@@ -260,13 +274,13 @@ class fwPKM(Module):
             q1, q2,
             final_indices, final_scores,
             gates, values, memories,
-            indices1, indices2, top_sub_indices,
+            indices1, indices2, sub_indices,
             dist1, dist2
         ) = [remove_last_token(intermediates[key]) for key in (
             'q1', 'q2',
             'final_indices', 'final_scores',
             'gates', 'values', 'memories',
-            'indices1', 'indices2', 'top_sub_indices',
+            'indices1', 'indices2', 'sub_indices',
             'dist1', 'dist2'
         )]
 
@@ -288,8 +302,8 @@ class fwPKM(Module):
 
         # now propagate top_scores_grad back to the keys
 
-        sub_indices1 = top_sub_indices // k
-        sub_indices2 = top_sub_indices % k
+        sub_indices1 = sub_indices // k
+        sub_indices2 = sub_indices % k
 
         final_indices1 = indices1.gather(-1, sub_indices1)
         final_indices2 = indices2.gather(-1, sub_indices2)
