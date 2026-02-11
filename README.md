@@ -22,10 +22,11 @@ mem = fwPKM(
     dim_queries_keys = 512,
     dim_values = 512,
     topk = 8,
-    learning_rate = 1.
+    learning_rate = 1.,
+    chunk_size = 256
 )
 
-tokens = torch.randn(2, 1024, 512)
+tokens = torch.randn(2, 256, 512)
 
 # forward a chunk of tokens for retrieved and the fast weight episodic memories
 
