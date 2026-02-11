@@ -143,16 +143,22 @@ class fwPKM(Module):
         scores
     ):
         num_keys = self.num_keys
+        b, n, _ = indices.shape
+
+        # key indices for the two keypads
+
         key_indices = stack((indices // num_keys, indices % num_keys))
-        key_indices = rearrange(key_indices, 'two ... -> two (...)')
-        scores = repeat(scores.flatten(), '... -> two ...', two = 2)
+        scores = repeat(scores, 'b n k -> two b n k', two = 2)
 
-        zeros = torch.zeros(2, num_keys, device = self.device)
-        acc_scores = zeros.scatter_add(1, key_indices, scores)
+        # compute distribution per token and keypad
 
-        probs = l1norm(acc_scores, dim = -1)
+        shape = (2, b, n, num_keys)
+        probs = torch.zeros(shape, device = self.device)
+        probs.scatter_add_(-1, key_indices, scores)
 
-        addressing_loss = entropy(probs).sum() / indices.shape[1]
+        # average of per-token, per-keypad entropies
+
+        addressing_loss = entropy(probs).mean(dim = 0)
         return addressing_loss * self.addressing_loss_weight
 
     def retrieve(
@@ -333,7 +339,7 @@ class fwPKM(Module):
         split_sizes = (min(num_tokens, to_bound), *([chunk_size] * (rem // chunk_size)), rem % chunk_size)
         segments = tokens.split(list(filter(is_greater_than_zero, split_sizes)), dim = 1)
 
-        out_list, total_loss = [], 0.
+        out_list, loss_list = [], []
 
         for segment in segments:
             # potential chunked store across boundary
@@ -371,7 +377,7 @@ class fwPKM(Module):
             past_mem = Memories(mv, mk, get_last_token(segment), cached, past_mem.token_count + slen, past_mem.num_cached + slen)
 
             out_list.append(out)
-            total_loss = total_loss + self.calculate_addressing_loss(indices, scores) * slen
+            loss_list.append(self.calculate_addressing_loss(indices, scores))
 
         # finalize next memories
 
@@ -384,5 +390,5 @@ class fwPKM(Module):
         # finalize return
 
         out = cat(out_list, dim = 1)
-        res = (out, total_loss / num_tokens) if return_addressing_loss else out
+        res = (out, cat(loss_list, dim = 1)) if return_addressing_loss else out
         return (res, past_mem) if return_next_memories else res
