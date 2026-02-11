@@ -286,9 +286,9 @@ class fwPKM(Module):
 
         target_values = remove_first_token(intermediates['target_values'])
 
-        # MSE loss with lookahead
+        # mse loss with lookahead
 
-        error = gates * (values - target_values) * self.learning_rate
+        error = gates * (target_values - values) * self.learning_rate # swapped for gradient descent
 
         memories_grad = einx.multiply('... d, ... topk -> (... topk) d', error, final_scores)
 
