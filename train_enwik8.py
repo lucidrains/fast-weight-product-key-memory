@@ -7,7 +7,8 @@
 #   "local-attention",
 #   "accelerate",
 #   "fast-weight-product-key-memory",
-#   "fire"
+#   "fire",
+#   "discrete-continuous-embed-readout"
 # ]
 # ///
 
@@ -31,6 +32,8 @@ from accelerate import Accelerator
 from local_attention import LocalAttention, LocalMHA
 from local_attention.transformer import FeedForward
 from einops import rearrange, repeat, einsum
+
+from discrete_continuous_embed_readout import EmbedAndReadout
 
 from fast_weight_product_key_memory import fwPKM
 
@@ -63,17 +66,6 @@ def top_k(logits, thres = 0.9):
     probs.scatter_(-1, ind, val)
     return probs
 
-def gumbel_noise(logits):
-    noise = torch.zeros_like(logits).uniform_(0, 1)
-    return -torch.log(-torch.log(noise))
-
-def sample(logits, temperature = 1., filter_thres = 0.9):
-    logits = logits / max(temperature, 1e-10)
-    if filter_thres < 1.:
-        logits = top_k(logits, thres = filter_thres)
-
-    return torch.argmax(logits + gumbel_noise(logits), dim = -1)
-
 # sampling helpers
 
 def base_decoding(
@@ -90,11 +82,17 @@ def base_decoding(
 
     for _ in range(sample_num_times):
         logits, cache = net(out, return_cache = True, cache = cache)
-        last_logit = logits[:, -1]
+        
+        sampled_token = net.readout.sample_discrete(
+            logits[:, -1:],
+            temperature = temperature,
+            filter_fn = top_k,
+            filter_kwargs = dict(thres = filter_thres)
+        )
 
-        sampled_token = sample(last_logit, temperature = temperature, filter_thres = filter_thres)
+        sampled_token = rearrange(sampled_token, 'b ... -> b (...)')
 
-        out = torch.cat((out, sampled_token[:, None]), dim = -1)
+        out = torch.cat((out, sampled_token), dim = -1)
 
     return out[..., prompt_seq_len:]
 
@@ -116,8 +114,11 @@ class Transformer(Module):
         neural_memory_layers = default(neural_memory_layers, ())
         neural_memory_kwargs = default(neural_memory_kwargs, dict())
 
-        self.token_emb = nn.Embedding(num_tokens, dim)
-        self.to_logits = nn.Linear(dim, num_tokens, bias = False)
+        self.embed, self.readout = EmbedAndReadout(
+            dim = dim,
+            num_discrete = num_tokens,
+            weight_tie = False
+        )
 
         self.pos_emb = nn.Embedding(max_seq_len, dim)
 
@@ -159,7 +160,7 @@ class Transformer(Module):
 
         n, device = x.shape[1], x.device
 
-        x = self.token_emb(x)
+        x = self.embed(x)
         x = x + self.pos_emb(torch.arange(n, device = device) + offset)
 
         total_addressing_loss = self.zero
@@ -197,15 +198,16 @@ class Transformer(Module):
             new_layer_caches.append((next_nm_cache, next_attn_cache))
 
         x = self.norm(x)
-        logits = self.to_logits(x)
 
         if not return_loss:
+            logits = self.readout(x)
+
             if not return_cache:
                 return logits
 
             return logits, (new_layer_caches, offset + n)
 
-        loss = F.cross_entropy(rearrange(logits, 'b n c -> b c n'), labels)
+        loss = self.readout(x, labels, return_loss = True)
 
         return loss + total_addressing_loss, (loss, total_addressing_loss)
 
@@ -314,7 +316,6 @@ def train(
 
             optim.step()
             optim.zero_grad()
-
 
         if divisible_by(i, 10):
             accelerator.print(f"step {i} training loss: {ar_loss.item():.3f}, addressing loss: {addr_loss.item():.3f}")
