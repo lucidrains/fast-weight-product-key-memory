@@ -9,6 +9,7 @@
 #   "discrete-continuous-embed-readout",
 #   "fast-weight-product-key-memory",
 #   "accelerate",
+#   "wandb",
 # ]
 # ///
 
@@ -258,12 +259,26 @@ def train(
     topk = 8,
     addressing_loss_weight = 5.,
     chunk_size = 256,
-    detach_next_memories_every = 2
+    detach_next_memories_every = 2,
+    use_wandb: bool = False,
+    wandb_project: str = 'fast-weight-product-key-memory',
+    wandb_run_name: str | None = None
 ):
     # accelerator
 
-    accelerator = Accelerator(gradient_accumulation_steps = grad_accum_every)
+    accelerator = Accelerator(
+        gradient_accumulation_steps = grad_accum_every,
+        log_with = 'wandb' if use_wandb else None
+    )
+
     device = accelerator.device
+
+    if use_wandb:
+        accelerator.init_trackers(
+            wandb_project,
+            config = locals(),
+            init_kwargs = {"wandb": {"name": wandb_run_name}}
+        )
 
     # model setup
 
@@ -346,12 +361,22 @@ def train(
         if divisible_by(i, 10):
             accelerator.print(f"step {i} training loss: {ar_loss.item():.3f}, addressing loss: {addr_loss.item():.3f}")
 
+            accelerator.log({
+                "train_ar_loss": ar_loss.item(),
+                "train_addr_loss": addr_loss.item()
+            }, step = i)
+
         if divisible_by(i, validate_every):
             model.eval()
             with torch.no_grad():
                 valid_data = next(val_loader)
                 loss, (ar_loss, addr_loss) = model(valid_data, return_loss = True)
                 accelerator.print(f"validation loss: {ar_loss.item():.3f}, addressing loss: {addr_loss.item():.3f}")
+
+                accelerator.log({
+                    "val_ar_loss": ar_loss.item(),
+                    "val_addr_loss": addr_loss.item()
+                }, step = i)
 
         if divisible_by(i, generate_every) and accelerator.is_main_process:
             model.eval()
@@ -371,6 +396,8 @@ def train(
             base_decode_output = decode_tokens(sampled[0])
 
             print(f"\nOUTPUT: {base_decode_output}\n")
+
+    accelerator.end_training()
 
 if __name__ == "__main__":
     fire.Fire(train)
