@@ -109,10 +109,10 @@ class Transformer(Module):
         dim_head = 64,
         neural_memory_layers: tuple[int, ...] | None = None,
         neural_memory_kwargs: dict | None = None,
-        detach_next_episodic_memories = False
+        detach_next_memories_every: int | None = None
     ):
         super().__init__()
-        self.detach_next_episodic_memories = detach_next_episodic_memories
+        self.detach_next_memories_every = detach_next_memories_every
 
         neural_memory_layers = default(neural_memory_layers, ())
         neural_memory_kwargs = default(neural_memory_kwargs, dict())
@@ -149,9 +149,9 @@ class Transformer(Module):
         return_loss = False,
         return_cache = False,
         cache = None,
-        detach_next_episodic_memories = None
+        detach_next_memories_every: int | None = None
     ):
-        detach_next_episodic_memories = default(detach_next_episodic_memories, self.detach_next_episodic_memories)
+        detach_next_memories_every = default(detach_next_memories_every, self.detach_next_memories_every)
 
         if return_loss:
             tokens, labels = tokens[:, :-1], tokens[:, 1:]
@@ -192,7 +192,7 @@ class Transformer(Module):
                     return_addressing_loss = True,
                     past_memories = nm_cache,
                     return_next_memories = True,
-                    detach_next_memories = detach_next_episodic_memories # like transformer-xl, detach the memories from previous segments
+                    detach_next_memories_every = detach_next_memories_every # truncated bptt - periodically detach memories
                 )
 
                 neural_memory_out, addressing_loss = neural_memory_res
@@ -258,7 +258,7 @@ def train(
     topk = 8,
     addressing_loss_weight = 5.,
     chunk_size = 256,
-    detach_next_episodic_memories = True
+    detach_next_memories_every = 2
 ):
     # accelerator
 
@@ -283,7 +283,7 @@ def train(
             addressing_loss_weight = addressing_loss_weight,
             chunk_size = chunk_size
         ),
-        detach_next_episodic_memories = detach_next_episodic_memories
+        detach_next_memories_every = detach_next_memories_every
     )
 
     # prepare enwik8 data

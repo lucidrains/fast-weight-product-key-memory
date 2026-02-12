@@ -36,6 +36,9 @@ def default(v, d):
 def is_greater_than_zero(n):
     return n > 0
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def LinearNoBias(dim, dim_out):
     return nn.Linear(dim, dim_out, bias = False)
 
@@ -340,7 +343,7 @@ class fwPKM(Module):
         return_next_memories = False,
         return_addressing_loss = False,
         past_memories: Memories | None = None,
-        detach_next_memories = False,
+        detach_next_memories_every: int | None = None,
         idw_eps = 1e-3
     ):
         past_mem = default(past_memories, self.init_memories)
@@ -355,7 +358,11 @@ class fwPKM(Module):
 
         out_list, loss_list = [], []
 
-        for segment in segments:
+        for chunk_index, segment in enumerate(segments):
+            # periodic truncated bptt - detach memories every N chunks
+
+            should_detach = exists(detach_next_memories_every) and divisible_by(chunk_index + 1, detach_next_memories_every)
+
             # potential chunked store across boundary
 
             if past_mem.num_cached == chunk_size:
@@ -365,7 +372,7 @@ class fwPKM(Module):
                     idw_eps = idw_eps
                 )
 
-                mv, mk = self.store(s_inter, past_memories = past_mem, detach_next_memories = detach_next_memories, idw_eps = idw_eps)
+                mv, mk = self.store(s_inter, past_memories = past_mem, detach_next_memories = should_detach, idw_eps = idw_eps)
                 past_mem = past_mem._replace(memory_values = mv, keys = mk, cached_tokens = None, num_cached = 0)
 
             # retrieve outputs
@@ -395,7 +402,7 @@ class fwPKM(Module):
 
         # finalize next memories
 
-        if detach_next_memories:
+        if should_detach:
             past_mem = past_mem._replace(
                 memory_values = past_mem.memory_values.detach(),
                 keys = past_mem.keys.detach()
