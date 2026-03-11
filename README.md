@@ -4,6 +4,10 @@
 
 Implementation of the [Fast Weight Product Key Memory](https://arxiv.org/abs/2601.00671) proposed by Sakana AI
 
+## Appreciation
+
+- [Pranoy](https://codeberg.org/pranoyr) for the contribution of multi-head variant!
+
 ## Install
 
 ```bash
@@ -46,11 +50,6 @@ Character-level language model with `fwPKM`
 ```shell
 $ uv run train_enwik8.py
 ```
-
-## Appreciation
-
-- [Pranoy](https://codeberg.org/pranoyr) for the contribution of multi-head fwPKM!
-
 ## Citations
 
 ```bibtex

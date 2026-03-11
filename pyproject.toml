@@ -1,6 +1,6 @@
 [project]
 name = "fast-weight-product-key-memory"
-version = "0.0.7"
+version = "0.0.8"
 description = "Fast Weight Product Key Memory"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -58,3 +58,11 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["fast_weight_product_key_memory"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "fast_weight_product_key_memory",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
