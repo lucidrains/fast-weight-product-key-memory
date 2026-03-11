@@ -47,6 +47,10 @@ Character-level language model with `fwPKM`
 $ uv run train_enwik8.py
 ```
 
+## Appreciation
+
+- [Pranoy](https://codeberg.org/pranoyr) for the contribution of multi-head fwPKM!
+
 ## Citations
 
 ```bibtex
