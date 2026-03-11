@@ -75,6 +75,7 @@ class fwPKM(Module):
         self,
         dim,
         *,
+        heads = 4,
         chunk_size = 256,
         num_memories = 512 * 512,
         dim_queries_keys = 512,
@@ -86,14 +87,19 @@ class fwPKM(Module):
         super().__init__()
         assert sqrt(num_memories).is_integer(), 'num memories must have an integer square root'
 
-        self.memories = nn.Parameter(torch.randn(num_memories, dim_values))
+        self.heads = heads
+        self.dim_head_qk = dim_queries_keys // heads
+        self.dim_head_v = dim_values // heads
+
+        self.memories = nn.Parameter(torch.randn(num_memories, heads, self.dim_head_v))
+
 
         # pkm related
 
         self.topk = topk
 
         num_keys = int(sqrt(num_memories))
-        self.keys = nn.Parameter(torch.randn(2, num_keys, dim_queries_keys) * 1e-2)
+        self.keys = nn.Parameter(torch.randn(2, heads, num_keys, self.dim_head_qk) * 1e-2)
 
         self.num_keys = num_keys
         self.num_memories = num_memories
@@ -103,18 +109,20 @@ class fwPKM(Module):
         self.to_queries = Sequential(
             RMSNorm(dim),
             LinearNoBias(dim, dim_queries_keys * 2),
-            Rearrange('... (two d) -> two ... d', two = 2)
+             Rearrange('... (two h d) -> two ... h d', two = 2, h = heads)
         )
 
         self.to_gates = Sequential(
             RMSNorm(dim),
             LinearNoBias(dim, 1),
-            nn.Sigmoid()
+            nn.Sigmoid(),
+            Rearrange('... 1 -> ... 1 1')
         )
 
         self.to_values = Sequential(
             RMSNorm(dim),
-            LinearNoBias(dim, dim_values)
+            LinearNoBias(dim, dim_values),
+            Rearrange('... (h d) -> ... h d', h = heads)
         )
 
         self.to_out = Sequential(
@@ -146,16 +154,16 @@ class fwPKM(Module):
         scores
     ):
         num_keys = self.num_keys
-        b, n, _ = indices.shape
+        b, n, h, _ = indices.shape
 
         # key indices for the two keypads
 
         key_indices = stack((indices // num_keys, indices % num_keys))
-        scores = repeat(scores, 'b n k -> two b n k', two = 2)
+        scores = repeat(scores, 'b n h k -> two b n h k', two = 2)
 
         # compute distribution per token and keypad
 
-        shape = (2, b, n, num_keys)
+        shape = (2, b, n, h, num_keys)
         probs = torch.zeros(shape, device = self.device)
         probs.scatter_add_(-1, key_indices, scores)
 
@@ -183,8 +191,8 @@ class fwPKM(Module):
 
         k1, k2 = keys
 
-        dist1 = cdist(q1, k1) ** 2
-        dist2 = cdist(q2, k2) ** 2
+        dist1 = torch.sum(einx.subtract('b n h d, h k d -> b n h k d', q1, k1) **2, dim = -1)
+        dist2 = torch.sum(einx.subtract('b n h d, h k d -> b n h k d', q2, k2) **2, dim = -1)
 
         score1, score2 = -log(dist1, eps = idw_eps), -log(dist2, eps = idw_eps)
 
@@ -219,12 +227,13 @@ class fwPKM(Module):
 
         final_scores = top_scores.softmax(dim = -1)
 
-        memories = self.memories[final_indices]
+        h_idx = torch.arange(self.heads, device=self.device).view(1, 1, self.heads, 1)
+        memories = self.memories[final_indices, h_idx, :]
 
         # add the past memories
 
         if exists(past_memories):
-            gathered_past_memories = past_memories.memory_values[final_indices]
+            gathered_past_memories = past_memories.memory_values[final_indices, h_idx, :]
             memories = memories + gathered_past_memories
 
         values = einsum(memories, final_scores, '... topk d, ... topk -> ... d')
@@ -238,7 +247,8 @@ class fwPKM(Module):
         target_values = z_score(target_values)
 
         output = target_values.lerp(values, gates)
-
+        
+        output = rearrange(output, 'b n h d -> b n (h d)')
         out = self.to_out(output)
 
         # return everything needed for store
@@ -293,10 +303,10 @@ class fwPKM(Module):
 
         error = gates * (target_values - values) * self.learning_rate # swapped for gradient descent
 
-        memories_grad = einx.multiply('... d, ... topk -> (... topk) d', error, final_scores)
+        memories_grad = einx.multiply('... h d, ... h topk -> (... topk) h d', error, final_scores)
 
-        flattened_final_indices = final_indices.flatten()
-        final_indices_expanded = repeat(flattened_final_indices, '... -> (...) d', d = memories_grad.shape[-1])
+    
+        final_indices_expanded = repeat(final_indices, 'b n h k -> (b n k) h d', d = memories_grad.shape[-1])
 
         next_fast_weight_memories = torch.zeros_like(self.memories).scatter_reduce_(0, final_indices_expanded, memories_grad, reduce = 'mean', include_self = False)
 
@@ -318,9 +328,9 @@ class fwPKM(Module):
 
         def get_keys_grad(q, k, d_sq, dist_grad):
             cdist_sq_grad = -dist_grad / (d_sq + idw_eps)
-            diff = einx.subtract('... d, m d -> ... m d', q, k)
-            grad = -2 * einx.multiply('... m, ... m d', cdist_sq_grad, diff)
-            return reduce(grad, '... m d -> m d', 'sum')
+            diff = einx.subtract('b n h d, h m d -> b n h m d', q, k)
+            grad = -2 * einx.multiply('... h m, ... h m d -> ... h m d', cdist_sq_grad, diff)
+            return reduce(grad, '... h m d -> h m d', 'sum')
 
         next_fast_weight_keys = stack((
             get_keys_grad(q1, intermediates['k1'], dist1, dist1_grad),
