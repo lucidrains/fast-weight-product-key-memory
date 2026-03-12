@@ -28,6 +28,8 @@ class MemorizingModel(nn.Module):
         self,
         num_tokens,
         dim,
+        *,
+        chunk_size = 4,
         use_memory = True
     ):
         super().__init__()
@@ -41,7 +43,7 @@ class MemorizingModel(nn.Module):
             dim_values = dim,
             learning_rate = 1.,
             topk = 4,
-            chunk_size = 4,
+            chunk_size = chunk_size,
             addressing_loss_weight = 1e-3
         ) if use_memory else None
 
@@ -58,19 +60,22 @@ class MemorizingModel(nn.Module):
 # training
 
 def train(
-    seed: int = 42,
-    num_tokens: int = 32,
-    dim: int = 128,
-    half_len: int = 8,
-    num_batches: int = 2000,
-    lr: float = 1e-3
+    seed = 42,
+    num_tokens = 32,
+    dim = 128,
+    half_len = 8,
+    chunk_size = 4,
+    num_batches = 2000,
+    lr = 1e-3
 ):
+    assert chunk_size <= half_len, "the chunk len should be less than or equal to the half len, or the memory isn't being properly tested"
+
     results = dict()
 
     for use_memory in (False, True):
         torch.manual_seed(seed)
 
-        model = MemorizingModel(num_tokens, dim, use_memory = use_memory)
+        model = MemorizingModel(num_tokens, dim, chunk_size = chunk_size, use_memory = use_memory)
         optim = Adam(model.parameters(), lr = lr)
 
         label = 'fwPKM' if use_memory else 'Baseline'
