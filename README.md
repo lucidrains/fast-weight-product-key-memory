@@ -63,3 +63,13 @@ $ uv run train_enwik8.py
     url     = {https://arxiv.org/abs/2601.00671},
 }
 ```
+
+```bibtex
+@article{Yaghoubietal2026,
+    author  = {Yaghoubi, Mohammad and Nieto-Posadas, Andres and Mosser, Coralie-Anne and Gisiger, Thomas and Wilson, Émmanuel and Williams, Sylvain and Brandon, Mark P.},
+    title   = {Predictive coding of reward in the hippocampus},
+    journal = {Nature},
+    year    = {2026},
+    doi     = {10.1038/s41586-025-09958-0}
+}
+```
