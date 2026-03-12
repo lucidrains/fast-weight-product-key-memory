@@ -54,12 +54,12 @@ $ uv run train_enwik8.py
 
 ```bibtex
 @misc{zhao2026fastweightproductkeymemory,
-    title   = {Fast-weight Product Key Memory}, 
+    title   = {Fast-weight Product Key Memory},
     author  = {Tianyu Zhao and Llion Jones},
     year    = {2026},
     eprint  = {2601.00671},
     archivePrefix = {arXiv},
     primaryClass = {cs.CL},
-    url     = {https://arxiv.org/abs/2601.00671}, 
+    url     = {https://arxiv.org/abs/2601.00671},
 }
 ```

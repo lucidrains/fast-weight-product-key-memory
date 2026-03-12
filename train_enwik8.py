@@ -85,7 +85,7 @@ def base_decoding(
 
     for _ in range(sample_num_times):
         logits, cache = net(out, return_cache = True, cache = cache)
-        
+
         sampled_token = net.readout.sample_discrete(
             logits[:, -1:],
             temperature = temperature,

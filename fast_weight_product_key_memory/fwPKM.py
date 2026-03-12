@@ -48,13 +48,15 @@ def log(t, eps = 1e-20):
     return (t + eps).log()
 
 def l1norm(t, dim = -1, eps = 1e-10):
-    return F.normalize(t, dim = -1, p = 1, eps = eps)
+    return F.normalize(t, dim = dim, p = 1, eps = eps)
 
 def entropy(prob):
     return -(prob * log(prob)).sum(dim = -1)
 
 def z_score(t, dim = -1, eps = 1e-10):
-    return (t - t.mean(dim = -1, keepdim = True)) / t.std(dim = -1, keepdim = True).clamp_min(eps)
+    numer = (t - t.mean(dim = dim, keepdim = True))
+    denom = t.std(dim = dim, keepdim = True)
+    return numer / denom.clamp_min(eps)
 
 def remove_last_token(t):
     return t[:, :-1]
@@ -82,10 +84,12 @@ class fwPKM(Module):
         dim_values = 512,
         learning_rate = 1.,
         topk = 8,
-        addressing_loss_weight = 10.
+        addressing_loss_weight = 10.,
+        mse_loss_weight_to_keys = 1.
     ):
         super().__init__()
         assert sqrt(num_memories).is_integer(), 'num memories must have an integer square root'
+        assert addressing_loss_weight > 0., 'addressing loss weight must be greater than 0.'
 
         self.heads = heads
         self.dim_head_qk = dim_queries_keys // heads
@@ -137,6 +141,8 @@ class fwPKM(Module):
 
         self.chunk_size = chunk_size
 
+        self.mse_loss_weight_to_keys = mse_loss_weight_to_keys
+
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
     @property
@@ -144,32 +150,12 @@ class fwPKM(Module):
         return self.zero.device
 
     @property
+    def has_mse_loss_weight_to_keys(self):
+        return self.mse_loss_weight_to_keys > 0.
+
+    @property
     def init_memories(self):
         return Memories(torch.zeros_like(self.memories), torch.zeros_like(self.keys))
-
-    def calculate_addressing_loss(
-        self,
-        indices,
-        scores
-    ):
-        num_keys = self.num_keys
-        b, n, h, _ = indices.shape
-
-        # key indices for the two keypads
-
-        key_indices = stack((indices // num_keys, indices % num_keys))
-        scores = repeat(scores, 'b n h k -> two b n h k', two = 2)
-
-        # compute distribution per token and keypad
-
-        shape = (2, b, n, h, num_keys)
-        probs = torch.zeros(shape, device = self.device)
-        probs.scatter_add_(-1, key_indices, scores)
-
-        # average of per-token, per-keypad entropies
-
-        addressing_loss = entropy(probs).mean(dim = 0)
-        return addressing_loss * self.addressing_loss_weight
 
     def retrieve(
         self,
@@ -246,7 +232,7 @@ class fwPKM(Module):
         target_values = z_score(target_values)
 
         output = target_values.lerp(values, gates)
-        
+
         output = rearrange(output, 'b n h d -> b n (h d)')
         out = self.to_out(output)
 
@@ -303,37 +289,92 @@ class fwPKM(Module):
         error = gates * (target_values - values) * self.learning_rate # swapped for gradient descent
 
         memories_grad = einx.multiply('... h d, ... h topk -> (... topk) h d', error, final_scores)
-    
+
         final_indices_expanded = repeat(final_indices, 'b n h k -> (b n k) h d', d = memories_grad.shape[-1])
 
         next_fast_weight_memories = torch.zeros_like(self.memories).scatter_reduce_(0, final_indices_expanded, memories_grad, reduce = 'mean', include_self = False)
 
-        final_scores_grad = einsum(error, memories, '... d, ... topk d -> ... topk')
-        top_scores_grad = final_scores * (final_scores_grad - (final_scores * final_scores_grad).sum(dim = -1, keepdim = True))
+        # unconditionally stack queries and keys for vectorization processing
 
-        # now propagate top_scores_grad back to the keys
+        k1, k2 = intermediates['k1'], intermediates['k2']
+        q1, q2 = intermediates['q1'], intermediates['q2']
+        indices1, indices2 = intermediates['indices1'], intermediates['indices2']
 
-        sub_indices1 = sub_indices // k
-        sub_indices2 = sub_indices % k
+        keys = stack((k1, k2))
+        queries = stack((q1, q2))
+        indices = stack((indices1, indices2))
 
-        final_indices1 = indices1.gather(-1, sub_indices1)
-        final_indices2 = indices2.gather(-1, sub_indices2)
+        b, n, h, _, num_keys = queries.shape[1], queries.shape[2], queries.shape[3], queries.shape[4], keys.shape[2]
 
-        grad_shape = shape_with_replace(dist1, {-1: num_keys})
+        dist_tgt = (einx.subtract('two b n h d, two h k d -> two b n h k d', queries, keys) ** 2).sum(dim = -1)
 
-        dist1_grad = torch.zeros(grad_shape, device = self.device).scatter_add_(-1, final_indices1, top_scores_grad)
-        dist2_grad = torch.zeros(grad_shape, device = self.device).scatter_add_(-1, final_indices2, top_scores_grad)
+        # initialize base distances gradient (tracks the NEGATIVE gradient for gradient descent)
 
-        def get_keys_grad(q, k, d_sq, dist_grad):
-            cdist_sq_grad = -dist_grad / (d_sq + idw_eps)
-            diff = einx.subtract('b n h d, h m d -> b n h m d', q, k)
-            grad = -2 * einx.multiply('... h m, ... h m d -> ... h m d', cdist_sq_grad, diff)
-            return reduce(grad, '... h m d -> h m d', 'sum')
+        dist_grad = torch.zeros((2, b, n, h, num_keys), device = self.device)
 
-        next_fast_weight_keys = stack((
-            get_keys_grad(q1, intermediates['k1'], dist1, dist1_grad),
-            get_keys_grad(q2, intermediates['k2'], dist2, dist2_grad)
-        ))
+        # analytical addressing loss gradient to the keys
+
+        # scores are negative log distances
+
+        score_tgt = -log(dist_tgt, eps = idw_eps)
+
+        # mask out everything except retrieved top k
+
+        mask = torch.full_like(score_tgt, float('-inf'))
+        mask.scatter_(-1, indices, score_tgt.gather(-1, indices))
+
+        # compute distribution per token and keypad
+
+        probs = F.softmax(mask, dim = -1)
+
+        # average of per-token, per-keypad entropies
+
+        p_bar = probs.mean(dim = (1, 2))
+
+        # analytical addressing loss gradient
+        # from marginal entropy H(p) = -p * log(p) -> dH/dp = -log(p) - 1
+
+        weights = self.addressing_loss_weight * self.learning_rate
+        dp_bar = -log(p_bar, eps = 1e-8) - 1.0
+        dp_bar = dp_bar * weights
+
+        dprobs = repeat(dp_bar, 'two h k -> two b n h k', b = b, n = n) / (b * n)
+
+        dmask = probs * (dprobs - (probs * dprobs).sum(dim = -1, keepdim = True))
+        dscore = torch.zeros_like(score_tgt).scatter_(-1, indices, dmask.gather(-1, indices))
+
+        ddist = -dscore / (dist_tgt + idw_eps)
+
+        # ddist here is the positive gradient of addressing loss
+        # since dist_grad represents the negative gradient for gradient descent, we subtract it
+
+        dist_grad = dist_grad - ddist
+
+        if self.has_mse_loss_weight_to_keys:
+            final_scores_grad = einsum(error, memories, '... d, ... topk d -> ... topk')
+            top_scores_grad = final_scores * (final_scores_grad - (final_scores * final_scores_grad).sum(dim = -1, keepdim = True))
+
+            # now propagate top_scores_grad back to the keys
+
+            sub_indices1 = sub_indices // k
+            sub_indices2 = sub_indices % k
+
+            final_indices1 = indices1.gather(-1, sub_indices1)
+            final_indices2 = indices2.gather(-1, sub_indices2)
+
+            top_scores_grad_stack = stack((top_scores_grad, top_scores_grad))
+            final_indices_stack = stack((final_indices1, final_indices2))
+
+            top_scores_grad_stack = top_scores_grad_stack * self.mse_loss_weight_to_keys
+            dist_grad.scatter_add_(-1, final_indices_stack, top_scores_grad_stack)
+
+        # unify backwards tracking onto the queries and keys -> directly yields negative gradient to ADD to keys
+
+        diff = einx.subtract('two b n h d, two h m d -> two b n h m d', queries, keys)
+        grad = -2 * einx.multiply('... h m, ... h m d -> ... h m d', dist_grad, diff)
+        next_fast_weight_keys = einx.sum('two b n h m d -> two h m d', grad)
+
+        # accumulate on top of old memories
 
         if exists(past_memories):
             next_fast_weight_memories = next_fast_weight_memories + past_memories.memory_values
@@ -349,7 +390,6 @@ class fwPKM(Module):
         self,
         tokens,
         return_next_memories = False,
-        return_addressing_loss = False,
         past_memories: Memories | None = None,
         detach_next_memories_every: int | None = None,
         idw_eps = 1e-3
@@ -360,11 +400,13 @@ class fwPKM(Module):
         # calc segments reaching chunk boundaries
 
         to_bound = chunk_size - (count % chunk_size)
-        rem = max(0, num_tokens - to_bound)
-        split_sizes = (min(num_tokens, to_bound), *([chunk_size] * (rem // chunk_size)), rem % chunk_size)
+        remainder = max(0, num_tokens - to_bound)
+        num_chunks, chunk_remainder = divmod(remainder, chunk_size)
+
+        split_sizes = (min(num_tokens, to_bound), *([chunk_size] * num_chunks), chunk_remainder)
         segments = tokens.split(list(filter(is_greater_than_zero, split_sizes)), dim = 1)
 
-        out_list, loss_list = [], []
+        out_list = []
 
         for chunk_index, segment in enumerate(segments):
             # periodic truncated bptt - detach memories every N chunks
@@ -374,13 +416,13 @@ class fwPKM(Module):
             # potential chunked store across boundary
 
             if past_mem.num_cached == chunk_size:
-                _, s_inter = self.retrieve(
+                _, store_inter = self.retrieve(
                     cat((past_mem.cached_tokens, get_first_token(segment)), dim = 1),
                     past_memories = past_mem,
                     idw_eps = idw_eps
                 )
 
-                mv, mk = self.store(s_inter, past_memories = past_mem, detach_next_memories = should_detach, idw_eps = idw_eps)
+                mv, mk = self.store(store_inter, past_memories = past_mem, detach_next_memories = should_detach, idw_eps = idw_eps)
                 past_mem = past_mem._replace(memory_values = mv, keys = mk, cached_tokens = None, num_cached = 0)
 
             # retrieve outputs
@@ -406,7 +448,6 @@ class fwPKM(Module):
             past_mem = Memories(mv, mk, get_last_token(segment), cached, past_mem.token_count + slen, past_mem.num_cached + slen)
 
             out_list.append(out)
-            loss_list.append(self.calculate_addressing_loss(indices, scores))
 
         # finalize next memories
 
@@ -418,6 +459,5 @@ class fwPKM(Module):
 
         # finalize return
 
-        out = cat(out_list, dim = 1)
-        res = (out, cat(loss_list, dim = 1)) if return_addressing_loss else out
+        res = cat(out_list, dim = 1)
         return (res, past_mem) if return_next_memories else res
