@@ -53,11 +53,6 @@ def l1norm(t, dim = -1, eps = 1e-10):
 def entropy(prob):
     return -(prob * log(prob)).sum(dim = -1)
 
-def z_score(t, dim = -1, eps = 1e-10):
-    numer = (t - t.mean(dim = dim, keepdim = True))
-    denom = t.std(dim = dim, keepdim = True)
-    return numer / denom.clamp_min(eps)
-
 def remove_last_token(t):
     return t[:, :-1]
 
@@ -125,7 +120,8 @@ class fwPKM(Module):
         self.to_values = Sequential(
             RMSNorm(dim),
             LinearNoBias(dim, dim_values),
-            Rearrange('... (h d) -> ... h d', h = heads)
+            Rearrange('... (h d) -> ... h d', h = heads),
+            nn.LayerNorm(self.dim_head_v, elementwise_affine = False) # z-score
         )
 
         self.to_out = Sequential(
@@ -228,8 +224,6 @@ class fwPKM(Module):
         gates = self.to_gates(tokens)
 
         target_values = self.to_values(tokens)
-
-        target_values = z_score(target_values)
 
         output = target_values.lerp(values, gates)
 
@@ -345,10 +339,11 @@ class fwPKM(Module):
 
         ddist = -dscore / (dist_tgt + idw_eps)
 
-        # ddist here is the positive gradient of addressing loss
-        # since dist_grad represents the negative gradient for gradient descent, we subtract it
+        # ddist is the negative gradient of addressing loss w.r.t. dist
+        # (i.e. the update direction - moving dist to maximize entropy)
+        # dist_grad accumulates in the same convention (negative gradient / update direction)
 
-        dist_grad = dist_grad - ddist
+        dist_grad = dist_grad + ddist
 
         if self.has_mse_loss_weight_to_keys:
             final_scores_grad = einsum(error, memories, '... d, ... topk d -> ... topk')
@@ -366,7 +361,16 @@ class fwPKM(Module):
             final_indices_stack = stack((final_indices1, final_indices2))
 
             top_scores_grad_stack = top_scores_grad_stack * self.mse_loss_weight_to_keys
-            dist_grad = dist_grad.scatter_add(-1, final_indices_stack, top_scores_grad_stack)
+
+            # top_scores_grad_stack is the negative gradient w.r.t. scores (update direction)
+            # score = -log(dist + eps) => d(score)/d(dist) = -1 / (dist + eps)
+            # so negative gradient w.r.t. dist = neg_grad_score * d(score)/d(dist)
+            #                                  = top_scores_grad * (-1/(dist + eps))
+
+            gathered_dist = dist_tgt.gather(-1, final_indices_stack)
+            dist_grad_from_mse = -top_scores_grad_stack / (gathered_dist + idw_eps)
+
+            dist_grad = dist_grad.scatter_add(-1, final_indices_stack, dist_grad_from_mse)
 
         # unify backwards tracking onto the queries and keys -> directly yields negative gradient to ADD to keys
 

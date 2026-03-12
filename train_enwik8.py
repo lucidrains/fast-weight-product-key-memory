@@ -176,10 +176,6 @@ class Transformer(Module):
         x = self.embed(tokens)
         rotary_pos_emb = self.rotary_emb(torch.arange(seq_len + offset, device = device))
 
-        # loss
-
-        total_addressing_loss = self.zero
-
         # layers
 
         for attn_norm, neural_memory, attn, ff_norm, ff in self.layers:
@@ -188,18 +184,14 @@ class Transformer(Module):
             next_nm_cache = nm_cache
 
             if exists(neural_memory):
-                neural_memory_res, next_nm_cache = neural_memory(
+                neural_memory_out, next_nm_cache = neural_memory(
                     x,
-                    return_addressing_loss = True,
                     past_memories = nm_cache,
                     return_next_memories = True,
                     detach_next_memories_every = detach_next_memories_every # truncated bptt - periodically detach memories
                 )
 
-                neural_memory_out, addressing_loss = neural_memory_res
-
                 x = x + neural_memory_out
-                total_addressing_loss = total_addressing_loss + addressing_loss.mean()
 
             attn_out, attn_intermediates = attn(
                 attn_norm(x),
@@ -233,7 +225,7 @@ class Transformer(Module):
 
         loss = self.readout(embed, labels, return_loss = True)
 
-        return loss + total_addressing_loss, (loss, total_addressing_loss)
+        return loss
 
 # training function
 
@@ -276,8 +268,7 @@ def train(
     if use_wandb:
         accelerator.init_trackers(
             wandb_project,
-            config = locals(),
-            init_kwargs = {"wandb": {"name": wandb_run_name}}
+            init_kwargs = dict(wandb = dict(name = wandb_run_name))
         )
 
     # model setup
@@ -348,7 +339,7 @@ def train(
         with accelerator.accumulate(model):
             data = next(train_loader)
 
-            loss, (ar_loss, addr_loss) = model(data, return_loss = True)
+            loss = model(data, return_loss = True)
 
             accelerator.backward(loss)
 
@@ -359,24 +350,22 @@ def train(
             optim.zero_grad()
 
         if divisible_by(i, 10):
-            accelerator.print(f"step {i} training loss: {ar_loss.item():.3f}, addressing loss: {addr_loss.item():.3f}")
+            accelerator.print(f"step {i} training loss: {loss.item():.3f}")
 
-            accelerator.log({
-                "train_ar_loss": ar_loss.item(),
-                "train_addr_loss": addr_loss.item()
-            }, step = i)
+            accelerator.log(dict(
+                train_ar_loss = loss.item()
+            ), step = i)
 
         if divisible_by(i, validate_every):
             model.eval()
             with torch.no_grad():
                 valid_data = next(val_loader)
-                loss, (ar_loss, addr_loss) = model(valid_data, return_loss = True)
-                accelerator.print(f"validation loss: {ar_loss.item():.3f}, addressing loss: {addr_loss.item():.3f}")
+                loss = model(valid_data, return_loss = True)
+                accelerator.print(f"validation loss: {loss.item():.3f}")
 
-                accelerator.log({
-                    "val_ar_loss": ar_loss.item(),
-                    "val_addr_loss": addr_loss.item()
-                }, step = i)
+                accelerator.log(dict(
+                    val_ar_loss = loss.item()
+                ), step = i)
 
         if divisible_by(i, generate_every) and accelerator.is_main_process:
             model.eval()
