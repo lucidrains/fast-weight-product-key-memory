@@ -93,7 +93,6 @@ class fwPKM(Module):
 
         self.memories = nn.Parameter(torch.randn(num_memories, heads, self.dim_head_v))
 
-
         # pkm related
 
         self.topk = topk
@@ -304,7 +303,6 @@ class fwPKM(Module):
         error = gates * (target_values - values) * self.learning_rate # swapped for gradient descent
 
         memories_grad = einx.multiply('... h d, ... h topk -> (... topk) h d', error, final_scores)
-
     
         final_indices_expanded = repeat(final_indices, 'b n h k -> (b n k) h d', d = memories_grad.shape[-1])
 

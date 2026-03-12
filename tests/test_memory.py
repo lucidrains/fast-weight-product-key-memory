@@ -1,15 +1,14 @@
-import torch
 import pytest
-from fast_weight_product_key_memory import fwPKM, Memories
-
-# helpers
-
 param = pytest.mark.parametrize
+
+import torch
+from fast_weight_product_key_memory import fwPKM, Memories
 
 # tests
 
-def test_memory():
-    pkm = fwPKM(512)
+@param('heads', [1, 4])
+def test_memory(heads):
+    pkm = fwPKM(512, heads = heads)
     tokens = torch.randn(2, 256, 512)
 
     (out, addressing_loss), memories = pkm(
@@ -25,15 +24,17 @@ def test_memory():
     )
 
     assert tokens.shape == retrieved.shape
-    assert addressing_loss.shape == (2, 256)
+    assert addressing_loss.shape == (2, 256, heads)
 
-def test_fw_pkm_basic_parity():
+@param('heads', [1, 4])
+def test_fw_pkm_basic_parity(heads):
     dim = 32
     seq_len = 32
     chunk_size = 16
 
     model = fwPKM(
         dim = dim,
+        heads = heads,
         num_memories = 16 * 16,
         dim_queries_keys = 16,
         dim_values = 16,
@@ -79,15 +80,17 @@ def test_fw_pkm_basic_parity():
     assert torch.allclose(parallel_state.memory_values, state_b.memory_values, atol = 1e-6)
     assert torch.allclose(parallel_state.keys, state_b.keys, atol = 1e-6)
 
+@param('heads', [1, 4])
 @param('seq_len, chunk_size', [
     (16, 8),
     (32, 16),
     (48, 16)
 ])
-def test_fw_pkm_parity_multi(seq_len, chunk_size):
+def test_fw_pkm_parity_multi(heads, seq_len, chunk_size):
     dim = 32
     model = fwPKM(
         dim = dim,
+        heads = heads,
         num_memories = 16 * 16,
         dim_queries_keys = 16,
         dim_values = 16,
@@ -129,10 +132,12 @@ def test_fw_pkm_parity_multi(seq_len, chunk_size):
     assert torch.allclose(parallel_loss, sequential_loss, atol = 1e-6)
     assert torch.allclose(parallel_state.memory_values, state.memory_values, atol = 1e-6)
 
-def test_fw_pkm_addressing_loss_unpacked():
+@param('heads', [1, 4])
+def test_fw_pkm_addressing_loss_unpacked(heads):
     dim = 32
     model = fwPKM(
         dim = dim,
+        heads = heads,
         num_memories = 16 * 16,
         dim_queries_keys = 16,
         dim_values = 16,
@@ -154,10 +159,12 @@ def test_fw_pkm_addressing_loss_unpacked():
     assert isinstance(res, tuple) and len(res) == 2 
     assert isinstance(res[0], tuple) and len(res[0]) == 2
 
-def test_fw_pkm_token_by_token():
+@param('heads', [1, 4])
+def test_fw_pkm_token_by_token(heads):
     dim = 32
     model = fwPKM(
         dim = dim,
+        heads = heads,
         num_memories = 4 * 4,
         dim_queries_keys = 8,
         dim_values = 8,
@@ -194,11 +201,13 @@ def test_fw_pkm_token_by_token():
     assert torch.allclose(parallel_loss, serial_loss, atol = 1e-6)
     assert torch.allclose(parallel_state.memory_values, state.memory_values, atol = 1e-6)
 
-def test_fw_pkm_causality():
+@param('heads', [1, 4])
+def test_fw_pkm_causality(heads):
     dim = 32
     seq_len = 8
     model = fwPKM(
         dim = dim,
+        heads = heads,
         num_memories = 16 * 16,
         dim_queries_keys = 16,
         dim_values = 16,
@@ -220,12 +229,14 @@ def test_fw_pkm_causality():
             
         tokens.grad.zero_()
 
+@param('heads', [1, 4])
 @param('chunk_size', [8, 16])
-def test_fw_pkm_unaligned_parity(chunk_size):
+def test_fw_pkm_unaligned_parity(heads, chunk_size):
     dim = 32
     seq_len = 32
     model = fwPKM(
         dim = dim,
+        heads = heads,
         num_memories = 16 * 16,
         dim_queries_keys = 16,
         dim_values = 16,
