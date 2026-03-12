@@ -340,8 +340,6 @@ class fwPKM(Module):
         ddist = -dscore / (dist_tgt + idw_eps)
 
         # ddist is the negative gradient of addressing loss w.r.t. dist
-        # (i.e. the update direction - moving dist to maximize entropy)
-        # dist_grad accumulates in the same convention (negative gradient / update direction)
 
         dist_grad = dist_grad + ddist
 
@@ -362,10 +360,7 @@ class fwPKM(Module):
 
             top_scores_grad_stack = top_scores_grad_stack * self.mse_loss_weight_to_keys
 
-            # top_scores_grad_stack is the negative gradient w.r.t. scores (update direction)
-            # score = -log(dist + eps) => d(score)/d(dist) = -1 / (dist + eps)
-            # so negative gradient w.r.t. dist = neg_grad_score * d(score)/d(dist)
-            #                                  = top_scores_grad * (-1/(dist + eps))
+            # propagate top_scores_grad back to dist
 
             gathered_dist = dist_tgt.gather(-1, final_indices_stack)
             dist_grad_from_mse = -top_scores_grad_stack / (gathered_dist + idw_eps)
@@ -376,7 +371,7 @@ class fwPKM(Module):
 
         diff = einx.subtract('two b n h d, two h m d -> two b n h m d', queries, keys)
         grad = -2 * einx.multiply('... h m, ... h m d -> ... h m d', dist_grad, diff)
-        next_fast_weight_keys = einx.sum('two b n h m d -> two h m d', grad)
+        next_fast_weight_keys = einx.sum('two b n h m d -> two h m d', grad) / (grad.shape[1] * grad.shape[2])
 
         # accumulate on top of old memories
 

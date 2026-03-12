@@ -236,9 +236,9 @@ def train(
     learning_rate = 1e-4,
     validate_every = 100,
     generate_every = 500,
-    generate_length = 512,
-    seq_len = 512,
-    prime_length = 128,
+    generate_length = 256,
+    seq_len = 256,
+    prime_length = 64,
     dim = 512,
     dim_head = 64,
     heads = 8,
@@ -252,9 +252,9 @@ def train(
     addressing_loss_weight = 5.,
     chunk_size = 256,
     detach_next_memories_every = 2,
-    use_wandb: bool = False,
-    wandb_project: str = 'fast-weight-product-key-memory',
-    wandb_run_name: str | None = None
+    use_wandb = False,
+    wandb_project = 'fast-weight-product-key-memory',
+    wandb_run_name = None
 ):
     # accelerator
 
