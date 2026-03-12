@@ -366,7 +366,7 @@ class fwPKM(Module):
             final_indices_stack = stack((final_indices1, final_indices2))
 
             top_scores_grad_stack = top_scores_grad_stack * self.mse_loss_weight_to_keys
-            dist_grad.scatter_add_(-1, final_indices_stack, top_scores_grad_stack)
+            dist_grad = dist_grad.scatter_add(-1, final_indices_stack, top_scores_grad_stack)
 
         # unify backwards tracking onto the queries and keys -> directly yields negative gradient to ADD to keys
 
