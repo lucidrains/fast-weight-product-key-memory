@@ -8,11 +8,12 @@
 # ///
 
 import fire
+from tqdm import tqdm
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import Adam
-from tqdm import tqdm
 
 from fast_weight_product_key_memory import fwPKM
 
@@ -21,8 +22,6 @@ from fast_weight_product_key_memory import fwPKM
 def exists(val):
     return val is not None
 
-# model
-
 class MemorizingModel(nn.Module):
     def __init__(
         self,
@@ -30,22 +29,30 @@ class MemorizingModel(nn.Module):
         dim,
         *,
         chunk_size = 4,
+        heads = 1,
+        num_memories = 256,
+        dim_queries_keys = 64,
+        learning_rate = 1.,
+        topk = 4,
+        addressing_loss_weight = 1e-3,
         use_memory = True
     ):
         super().__init__()
         self.embed = nn.Embedding(num_tokens, dim)
 
-        self.memory = fwPKM(
-            dim = dim,
-            heads = 1,
-            num_memories = 256,
-            dim_queries_keys = 64,
-            dim_values = dim,
-            learning_rate = 1.,
-            topk = 4,
-            chunk_size = chunk_size,
-            addressing_loss_weight = 1e-3
-        ) if use_memory else None
+        self.memory = None
+        if use_memory:
+            self.memory = fwPKM(
+                dim = dim,
+                heads = heads,
+                num_memories = num_memories,
+                dim_queries_keys = dim_queries_keys,
+                dim_values = dim,
+                learning_rate = learning_rate,
+                topk = topk,
+                chunk_size = chunk_size,
+                addressing_loss_weight = addressing_loss_weight
+            )
 
         self.head = nn.Linear(dim, num_tokens)
 
@@ -65,8 +72,15 @@ def train(
     dim = 128,
     half_len = 8,
     chunk_size = 4,
+    heads = 1,
+    num_memories = 256,
+    dim_queries_keys = 64,
+    learning_rate = 1.,
+    topk = 4,
+    addressing_loss_weight = 1e-3,
     num_batches = 2000,
-    lr = 1e-3
+    lr = 1e-3,
+    eval_batches = 15
 ):
     assert chunk_size <= half_len, "the chunk len should be less than or equal to the half len, or the memory isn't being properly tested"
 
@@ -75,7 +89,18 @@ def train(
     for use_memory in (False, True):
         torch.manual_seed(seed)
 
-        model = MemorizingModel(num_tokens, dim, chunk_size = chunk_size, use_memory = use_memory)
+        model = MemorizingModel(
+            num_tokens,
+            dim,
+            chunk_size = chunk_size,
+            heads = heads,
+            num_memories = num_memories,
+            dim_queries_keys = dim_queries_keys,
+            learning_rate = learning_rate,
+            topk = topk,
+            addressing_loss_weight = addressing_loss_weight,
+            use_memory = use_memory
+        )
         optim = Adam(model.parameters(), lr = lr)
 
         label = 'fwPKM' if use_memory else 'Baseline'
@@ -90,20 +115,28 @@ def train(
 
             x, labels = seq[:, :-1], seq[:, 1:]
 
+            logits = model(x)
+
+            # only calculate cross entropy loss on the second half, the recall portion
+
             loss = F.cross_entropy(
-                model(x).reshape(-1, num_tokens),
-                labels.reshape(-1)
+                logits[:, (half_len - 1):].reshape(-1, num_tokens),
+                labels[:, (half_len - 1):].reshape(-1)
             )
 
             loss.backward()
             optim.step()
             optim.zero_grad()
 
-            if i >= (num_batches - 15):
+            if i >= (num_batches - eval_batches):
                 model.eval()
                 with torch.no_grad():
-                    preds = model(x).argmax(dim = -1)
-                    acc = (preds[:, half_len:] == labels[:, half_len:]).float().mean()
+                    eval_half = torch.randint(0, num_tokens, (1, half_len))
+                    eval_seq = torch.cat((eval_half, eval_half), dim = -1)
+                    eval_x, eval_labels = eval_seq[:, :-1], eval_seq[:, 1:]
+
+                    preds = model(eval_x).argmax(dim = -1)
+                    acc = (preds[:, (half_len - 1):] == eval_labels[:, (half_len - 1):]).float().mean()
                     last_accs.append(acc.item())
 
         results[label] = sum(last_accs) / len(last_accs)
