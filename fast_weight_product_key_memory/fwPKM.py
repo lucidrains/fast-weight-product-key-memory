@@ -371,7 +371,7 @@ class fwPKM(Module):
 
         diff = einx.subtract('two b n h d, two h m d -> two b n h m d', queries, keys)
         grad = -2 * einx.multiply('... h m, ... h m d -> ... h m d', dist_grad, diff)
-        next_fast_weight_keys = einx.sum('two b n h m d -> two h m d', grad) / (grad.shape[1] * grad.shape[2])
+        next_fast_weight_keys = einx.sum('two b n h m d -> two h m d', grad)
 
         # accumulate on top of old memories
 
@@ -396,6 +396,9 @@ class fwPKM(Module):
         past_mem = default(past_memories, self.init_memories)
         num_tokens, count, chunk_size = tokens.shape[1], past_mem.token_count, self.chunk_size
 
+        if num_tokens == 0:
+            return (tokens, past_mem) if return_next_memories else tokens
+
         # calc segments reaching chunk boundaries
 
         to_bound = chunk_size - (count % chunk_size)
@@ -406,6 +409,7 @@ class fwPKM(Module):
         segments = tokens.split(list(filter(is_greater_than_zero, split_sizes)), dim = 1)
 
         out_list = []
+        should_detach = False
 
         for chunk_index, segment in enumerate(segments):
             # periodic truncated bptt - detach memories every N chunks
