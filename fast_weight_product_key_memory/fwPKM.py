@@ -4,7 +4,7 @@ from math import sqrt
 from functools import partial
 
 import torch
-from torch import nn, stack, cat, cdist
+from torch import nn, stack, cat, cdist, roll
 from torch import tensor, Tensor
 import torch.nn.functional as F
 from torch.nn import Module, Sequential, RMSNorm
@@ -53,14 +53,8 @@ def l1norm(t, dim = -1, eps = 1e-10):
 def entropy(prob):
     return -(prob * log(prob)).sum(dim = -1)
 
-def remove_last_token(t):
-    return t[:, :-1]
-
 def remove_first_token(t):
     return t[:, 1:]
-
-def get_first_token(t):
-    return t[:, :1]
 
 def get_last_token(t):
     return t[:, -1:]
@@ -82,11 +76,21 @@ class fwPKM(Module):
         addressing_loss_weight = 10.,
         mse_loss_weight_to_keys = 1.,
         use_gdn_update = False,
-        forget_gate_decay_init = 0.
+        forget_gate_decay_init = 0.,
+        use_boundary_embed = True
     ):
         super().__init__()
         assert sqrt(num_memories).is_integer(), 'num memories must have an integer square root'
         assert addressing_loss_weight > 0., 'addressing loss weight must be greater than 0.'
+
+        # boundary embedding - added to the hidden state of the last token of each completed chunk, and its query
+        # replaced by the embedding itself, so all chunk boundaries route to the same memory region. the store
+        # target for the boundary token is the chunk's first token, so the boundary slot comes to hold the previous
+        # chunk's first token - resolving the boundary prediction without any lookahead
+
+        self.boundary_embed = nn.Parameter(torch.zeros(dim)) if use_boundary_embed else None
+
+        self.use_boundary_embed = use_boundary_embed
 
         self.heads = heads
         self.dim_head_qk = dim_queries_keys // heads
@@ -166,16 +170,29 @@ class fwPKM(Module):
             torch.zeros(num_key_pads, batch, heads, num_keys, dim_head_qk, device = self.device)
         )
 
+    def boundary_queries(self, tokens):
+        # query for the boundary token is the boundary embedding itself, so all chunk boundaries route to the same memory region
+
+        if not exists(self.boundary_embed):
+            return tokens
+
+        batch = tokens.shape[0]
+
+        return cat((tokens[:, :-1], repeat(self.boundary_embed, 'd -> b 1 d', b = batch)), dim = 1)
+
     def retrieve(
         self,
         tokens,
         past_memories: Memories | None = None,
-        idw_eps = 1e-3
+        idw_eps = 1e-3,
+        query_tokens = None
     ):
         k, num_keys = self.topk, self.num_keys
         batch = tokens.shape[0]
 
-        q1, q2 = self.to_queries(tokens)
+        query_tokens = default(query_tokens, tokens)
+
+        q1, q2 = self.to_queries(query_tokens)
 
         # keys for pkm, accounting for fast weight memories (per batch element)
 
@@ -243,8 +260,7 @@ class fwPKM(Module):
         if self.use_gdn_update:
             # chunk-level forget gate - mean of the stored input embeddings, then projected (not projected then averaged)
 
-            store_window = tokens[:, :-1] if tokens.shape[1] > 1 else tokens
-            chunk_embedding = reduce(store_window, 'b n d -> b d', 'mean')
+            chunk_embedding = reduce(tokens, 'b n d -> b d', 'mean')
             forget_logits = self.to_forget_gates(chunk_embedding)
             forget_gates = (-self.forget_gate_decay * F.softplus(forget_logits)).exp()
 
@@ -296,7 +312,7 @@ class fwPKM(Module):
             gates, values, memories,
             indices1, indices2, sub_indices,
             dist1, dist2
-        ) = [remove_last_token(intermediates[key]) for key in (
+        ) = [intermediates[key] for key in (
             'q1', 'q2',
             'final_indices', 'final_scores',
             'gates', 'values', 'memories',
@@ -304,7 +320,10 @@ class fwPKM(Module):
             'dist1', 'dist2'
         )]
 
-        target_values = remove_first_token(intermediates['target_values'])
+        # store target for each token is the value of the following token, wrapping around at the chunk end - so the
+        # boundary slot comes to hold the value of the previous chunk's first token, no lookahead needed
+
+        target_values = roll(intermediates['target_values'], -1, dims = 1)
 
         # forget gate already aggregated per (batch, head) from the chunk mean embedding
 
@@ -323,7 +342,7 @@ class fwPKM(Module):
 
             values = einsum(decayed_memories, final_scores, '... topk d, ... topk -> ... d')
 
-        # mse loss with lookahead
+        # delta rule store
 
         error = gates * (target_values - values) * self.learning_rate # swapped for gradient descent
 
@@ -478,11 +497,24 @@ class fwPKM(Module):
 
             should_detach = exists(detach_next_memories_every) and divisible_by(chunk_index + 1, detach_next_memories_every)
 
-            # potential chunked store across boundary
+            segment_len = segment.shape[1]
+            ends_boundary = divisible_by(past_mem.token_count + segment_len, chunk_size)
+
+            # mark the last token of each completed chunk with the boundary embedding - added to its hidden state so
+            # the model knows it is special, and its query replaced by the embedding itself
+
+            if exists(self.boundary_embed) and ends_boundary:
+                segment = cat((segment[:, :-1], segment[:, -1:] + self.boundary_embed), dim = 1)
+
+            segment_queries = self.boundary_queries(segment) if ends_boundary else segment
+
+            # store the cached chunk - fully causal, no lookahead; the boundary token is stored against its own
+            # chunk's first token, so the memory is ready before any of the next chunk's predictions
 
             if past_mem.num_cached == chunk_size:
                 _, store_inter = self.retrieve(
-                    cat((past_mem.cached_tokens, get_first_token(segment)), dim = 1),
+                    past_mem.cached_tokens,
+                    query_tokens = self.boundary_queries(past_mem.cached_tokens),
                     past_memories = past_mem,
                     idw_eps = idw_eps
                 )
@@ -492,10 +524,9 @@ class fwPKM(Module):
 
             # retrieve outputs
 
-            segment_len = segment.shape[1]
-
             out, inter = self.retrieve(
                 safe_cat((past_mem.last_token, segment), dim = 1),
+                query_tokens = safe_cat((past_mem.last_token, segment_queries), dim = 1),
                 past_memories = past_mem,
                 idw_eps = idw_eps
             )

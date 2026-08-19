@@ -1,8 +1,11 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
+#     "einx",
+#     "einops",
 #     "fire",
 #     "torch",
+#     "torch-einops-utils",
 #     "tqdm"
 # ]
 # ///
