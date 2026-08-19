@@ -240,3 +240,86 @@ def test_fw_pkm_unaligned_parity(heads, chunk_size, mse_loss_weight_to_keys):
 
     assert torch.allclose(parallel_out, sequential_out, atol = 1e-6)
     assert torch.allclose(parallel_state.memory_values, curr_state.memory_values, atol = 1e-6)
+
+@param('heads', [1, 4])
+@param('mse_loss_weight_to_keys', [0., 1.])
+def test_fw_pkm_batch_parity(heads, mse_loss_weight_to_keys):
+    dim = 32
+    batch = 3
+    seq_len = 32
+
+    model = fwPKM(
+        dim = dim,
+        heads = heads,
+        num_memories = 16 * 16,
+        dim_queries_keys = 16,
+        dim_values = 16,
+        chunk_size = 8,
+        topk = 4,
+        learning_rate = 1.,
+        mse_loss_weight_to_keys = mse_loss_weight_to_keys
+    )
+
+    tokens = torch.randn(batch, seq_len, dim)
+
+    # parallel
+
+    parallel_out, parallel_state = model(
+        tokens,
+        return_next_memories = True
+    )
+
+    # sequential with unaligned chunks
+
+    curr_state = None
+    serial_outputs = []
+
+    for i in range(0, seq_len, 5):
+        chunk = tokens[:, i:i+5]
+        out, curr_state = model(
+            chunk,
+            past_memories = curr_state,
+            return_next_memories = True
+        )
+        serial_outputs.append(out)
+
+    sequential_out = torch.cat(serial_outputs, dim = 1)
+
+    assert torch.allclose(parallel_out, sequential_out, atol = 1e-6)
+    assert torch.allclose(parallel_state.memory_values, curr_state.memory_values, atol = 1e-6)
+    assert torch.allclose(parallel_state.keys, curr_state.keys, atol = 1e-6)
+
+@param('heads', [1, 4])
+@param('mse_loss_weight_to_keys', [0., 1.])
+def test_fw_pkm_batch_independence(heads, mse_loss_weight_to_keys):
+    dim = 32
+    batch = 3
+    seq_len = 32
+
+    model = fwPKM(
+        dim = dim,
+        heads = heads,
+        num_memories = 16 * 16,
+        dim_queries_keys = 16,
+        dim_values = 16,
+        chunk_size = 8,
+        topk = 4,
+        learning_rate = 1.,
+        mse_loss_weight_to_keys = mse_loss_weight_to_keys
+    )
+
+    tokens = torch.randn(batch, seq_len, dim)
+
+    # reordering batch elements must not affect per-element results (no cross-contamination)
+    # loose-ish tolerance: reordering changes memory layout, and CPU kernels produce up to
+    # ~1e-5 alignment-dependent float noise in the projections; cross-batch coupling would be O(1)
+
+    perm = torch.randperm(batch)
+    inv_perm = torch.argsort(perm)
+
+    out, state = model(tokens, return_next_memories = True)
+    out_perm, state_perm = model(tokens[perm], return_next_memories = True)
+
+    assert torch.allclose(out_perm[inv_perm], out, atol = 1e-4)
+    assert torch.allclose(state_perm.memory_values[inv_perm], state.memory_values, atol = 1e-4)
+    assert torch.allclose(state_perm.keys[:, inv_perm], state.keys, atol = 1e-4)

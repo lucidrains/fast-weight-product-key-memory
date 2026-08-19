@@ -1,6 +1,6 @@
 [project]
 name = "fast-weight-product-key-memory"
-version = "0.1.5"
+version = "0.2.0"
 description = "Fast Weight Product Key Memory"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

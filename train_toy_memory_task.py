@@ -35,7 +35,8 @@ class MemorizingModel(nn.Module):
         learning_rate = 1.,
         topk = 4,
         addressing_loss_weight = 1e-3,
-        use_memory = True
+        use_memory = True,
+        use_gdn_update = False
     ):
         super().__init__()
         self.embed = nn.Embedding(num_tokens, dim)
@@ -51,7 +52,8 @@ class MemorizingModel(nn.Module):
                 learning_rate = learning_rate,
                 topk = topk,
                 chunk_size = chunk_size,
-                addressing_loss_weight = addressing_loss_weight
+                addressing_loss_weight = addressing_loss_weight,
+                use_gdn_update = use_gdn_update
             )
 
         self.head = nn.Linear(dim, num_tokens)
@@ -80,7 +82,9 @@ def train(
     addressing_loss_weight = 1e-3,
     num_batches = 2000,
     lr = 1e-3,
-    eval_batches = 15
+    eval_batches = 15,
+    eval_every = 500,
+    use_gdn_update = False
 ):
     assert chunk_size <= half_len, "the chunk len should be less than or equal to the half len, or the memory isn't being properly tested"
 
@@ -99,11 +103,23 @@ def train(
             learning_rate = learning_rate,
             topk = topk,
             addressing_loss_weight = addressing_loss_weight,
-            use_memory = use_memory
+            use_memory = use_memory,
+            use_gdn_update = use_gdn_update
         )
         optim = Adam(model.parameters(), lr = lr)
 
         label = 'fwPKM' if use_memory else 'Baseline'
+
+        def eval_acc():
+            model.eval()
+            with torch.no_grad():
+                eval_half = torch.randint(0, num_tokens, (1, half_len))
+                eval_seq = torch.cat((eval_half, eval_half), dim = -1)
+                eval_x, eval_labels = eval_seq[:, :-1], eval_seq[:, 1:]
+
+                preds = model(eval_x).argmax(dim = -1)
+                return (preds[:, (half_len - 1):] == eval_labels[:, (half_len - 1):]).float().mean().item()
+
         pbar = tqdm(range(num_batches), desc = label)
         last_accs = []
 
@@ -128,16 +144,13 @@ def train(
             optim.step()
             optim.zero_grad()
 
-            if i >= (num_batches - eval_batches):
-                model.eval()
-                with torch.no_grad():
-                    eval_half = torch.randint(0, num_tokens, (1, half_len))
-                    eval_seq = torch.cat((eval_half, eval_half), dim = -1)
-                    eval_x, eval_labels = eval_seq[:, :-1], eval_seq[:, 1:]
+            # periodic eval to check convergence
 
-                    preds = model(eval_x).argmax(dim = -1)
-                    acc = (preds[:, (half_len - 1):] == eval_labels[:, (half_len - 1):]).float().mean()
-                    last_accs.append(acc.item())
+            if eval_every > 0 and i > 0 and i % eval_every == 0:
+                pbar.write(f'{label} batch {i}: eval acc {eval_acc():.1%}')
+
+            if i >= (num_batches - eval_batches):
+                last_accs.append(eval_acc())
 
         results[label] = sum(last_accs) / len(last_accs)
 

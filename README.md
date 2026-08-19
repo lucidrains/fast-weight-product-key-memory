@@ -73,3 +73,15 @@ $ uv run train_enwik8.py
     doi     = {10.1038/s41586-025-09958-0}
 }
 ```
+
+```bibtex
+@misc{cabannes2026sparsedeltamemoryscaling,
+    title   = {Sparse Delta Memory: Scaling the State of Linear RNNs through Sparsity},
+    author  = {Loïc Cabannes and Pierre-Emmanuel Mazaré and Gergely Szilvasy and Matthijs Douze and Maria Lomeli and Ilze Amanda Auzina and Justin Carpentier and Gabriel Synnaeve and Hervé Jégou},
+    year    = {2026},
+    eprint  = {2607.07386},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2607.07386},
+}
+```

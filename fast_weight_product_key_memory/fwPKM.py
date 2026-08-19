@@ -80,7 +80,9 @@ class fwPKM(Module):
         learning_rate = 1.,
         topk = 8,
         addressing_loss_weight = 10.,
-        mse_loss_weight_to_keys = 1.
+        mse_loss_weight_to_keys = 1.,
+        use_gdn_update = False,
+        forget_gate_decay_init = 0.
     ):
         super().__init__()
         assert sqrt(num_memories).is_integer(), 'num memories must have an integer square root'
@@ -139,6 +141,14 @@ class fwPKM(Module):
 
         self.mse_loss_weight_to_keys = mse_loss_weight_to_keys
 
+        # gdn update rule related (sparse delta memory, eq. 3-4)
+
+        self.use_gdn_update = use_gdn_update
+
+        if use_gdn_update:
+            self.to_forget_gates = nn.Linear(dim, heads, bias = True)
+            self.forget_gate_decay = nn.Parameter(tensor(forget_gate_decay_init))
+
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
     @property
@@ -149,9 +159,12 @@ class fwPKM(Module):
     def has_mse_loss_weight_to_keys(self):
         return self.mse_loss_weight_to_keys > 0.
 
-    @property
-    def init_memories(self):
-        return Memories(torch.zeros_like(self.memories), torch.zeros_like(self.keys))
+    def init_memories(self, batch):
+        num_key_pads, heads, num_keys, dim_head_qk = self.keys.shape
+        return Memories(
+            torch.zeros(batch, *self.memories.shape, device = self.device),
+            torch.zeros(num_key_pads, batch, heads, num_keys, dim_head_qk, device = self.device)
+        )
 
     def retrieve(
         self,
@@ -160,20 +173,21 @@ class fwPKM(Module):
         idw_eps = 1e-3
     ):
         k, num_keys = self.topk, self.num_keys
+        batch = tokens.shape[0]
 
         q1, q2 = self.to_queries(tokens)
 
-        # keys for pkm, accounting for fast weight memories
+        # keys for pkm, accounting for fast weight memories (per batch element)
 
-        keys = self.keys
+        keys = repeat(self.keys, 'two h m d -> two b h m d', b = batch)
 
         if exists(past_memories):
             keys = keys + past_memories.keys
 
         k1, k2 = keys
 
-        dist1 = torch.sum(einx.subtract('b n h d, h k d -> b n h k d', q1, k1) **2, dim = -1)
-        dist2 = torch.sum(einx.subtract('b n h d, h k d -> b n h k d', q2, k2) **2, dim = -1)
+        dist1 = torch.sum(einx.subtract('b n h d, b h k d -> b n h k d', q1, k1) **2, dim = -1)
+        dist2 = torch.sum(einx.subtract('b n h d, b h k d -> b n h k d', q2, k2) **2, dim = -1)
 
         score1, score2 = -log(dist1, eps = idw_eps), -log(dist2, eps = idw_eps)
 
@@ -208,13 +222,14 @@ class fwPKM(Module):
 
         final_scores = top_scores.softmax(dim = -1)
 
-        h_idx = torch.arange(self.heads, device=self.device).view(1, 1, self.heads, 1)
+        h_idx = rearrange(torch.arange(self.heads, device = self.device), 'h -> 1 1 h 1')
         memories = self.memories[final_indices, h_idx, :]
 
-        # add the past memories
+        # add the past memories (fast weights are per batch element)
 
         if exists(past_memories):
-            gathered_past_memories = past_memories.memory_values[final_indices, h_idx, :]
+            b_idx = rearrange(torch.arange(batch, device = self.device), 'b -> b 1 1 1')
+            gathered_past_memories = past_memories.memory_values[b_idx, final_indices, h_idx, :]
             memories = memories + gathered_past_memories
 
         values = einsum(memories, final_scores, '... topk d, ... topk -> ... d')
@@ -222,6 +237,18 @@ class fwPKM(Module):
         # gates and values
 
         gates = self.to_gates(tokens)
+
+        forget_gates = None
+
+        if self.use_gdn_update:
+            # chunk-level forget gate - mean of the stored input embeddings, then projected (not projected then averaged)
+
+            store_window = tokens[:, :-1] if tokens.shape[1] > 1 else tokens
+            chunk_embedding = reduce(store_window, 'b n d -> b d', 'mean')
+            forget_logits = self.to_forget_gates(chunk_embedding)
+            forget_gates = (-self.forget_gate_decay * F.softplus(forget_logits)).exp()
+
+        # target values
 
         target_values = self.to_values(tokens)
 
@@ -244,6 +271,7 @@ class fwPKM(Module):
             final_indices = final_indices,
             final_scores = final_scores,
             gates = gates,
+            forget_gates = forget_gates,
             target_values = target_values,
             values = values,
             memories = memories,
@@ -278,15 +306,36 @@ class fwPKM(Module):
 
         target_values = remove_first_token(intermediates['target_values'])
 
+        # forget gate already aggregated per (batch, head) from the chunk mean embedding
+
+        forget_gate = intermediates['forget_gates'] if self.use_gdn_update else None
+
+        batch = final_indices.shape[0]
+
+        # gdn update rule - decay the selected fast weights, then compute the delta against the decayed memories
+
+        if self.use_gdn_update and exists(past_memories):
+            h_idx = rearrange(torch.arange(self.heads, device = self.device), 'h -> 1 1 h 1')
+            b_idx = rearrange(torch.arange(batch, device = self.device), 'b -> b 1 1 1')
+            past_fast_memories = past_memories.memory_values[b_idx, final_indices, h_idx, :]
+
+            decayed_memories = memories - einx.multiply('b n h k d, b h -> b n h k d', past_fast_memories, 1. - forget_gate)
+
+            values = einsum(decayed_memories, final_scores, '... topk d, ... topk -> ... d')
+
         # mse loss with lookahead
 
         error = gates * (target_values - values) * self.learning_rate # swapped for gradient descent
 
-        memories_grad = einx.multiply('... h d, ... h topk -> (... topk) h d', error, final_scores)
+        memories_grad = einx.multiply('b n h d, b n h topk -> b n h topk d', error, final_scores)
 
-        final_indices_expanded = repeat(final_indices, 'b n h k -> (b n k) h d', d = memories_grad.shape[-1])
+        dim_head_v = memories_grad.shape[-1]
 
-        next_fast_weight_memories = torch.zeros_like(self.memories).scatter_reduce_(0, final_indices_expanded, memories_grad, reduce = 'mean', include_self = False)
+        final_indices_expanded = repeat(final_indices, 'b n h k -> b (n k) h d', d = dim_head_v)
+
+        memories_grad_expanded = rearrange(memories_grad, 'b n h k d -> b (n k) h d')
+
+        next_fast_weight_memories = torch.zeros(batch, *self.memories.shape, device = self.device).scatter_reduce_(1, final_indices_expanded, memories_grad_expanded, reduce = 'mean', include_self = False)
 
         # unconditionally stack queries and keys for vectorization processing
 
@@ -298,13 +347,14 @@ class fwPKM(Module):
         queries = stack((q1, q2))
         indices = stack((indices1, indices2))
 
-        b, n, h, _, num_keys = queries.shape[1], queries.shape[2], queries.shape[3], queries.shape[4], keys.shape[2]
+        batch, seq_len, heads = queries.shape[1], queries.shape[2], queries.shape[3]
+        num_keys = keys.shape[3]
 
-        dist_tgt = (einx.subtract('two b n h d, two h k d -> two b n h k d', queries, keys) ** 2).sum(dim = -1)
+        dist_tgt = (einx.subtract('two b n h d, two b h m d -> two b n h m d', queries, keys) ** 2).sum(dim = -1)
 
         # initialize base distances gradient (tracks the NEGATIVE gradient for gradient descent)
 
-        dist_grad = torch.zeros((2, b, n, h, num_keys), device = self.device)
+        dist_grad = torch.zeros((2, batch, seq_len, heads, num_keys), device = self.device)
 
         # analytical addressing loss gradient to the keys
 
@@ -321,9 +371,9 @@ class fwPKM(Module):
 
         probs = F.softmax(mask, dim = -1)
 
-        # average of per-token, per-keypad entropies
+        # average of per-token, per-keypad entropies within each batch element (fast keys are per batch element)
 
-        p_bar = probs.mean(dim = (1, 2))
+        p_bar = reduce(probs, 'two b n h k -> two b h k', 'mean')
 
         # analytical addressing loss gradient
         # from marginal entropy H(p) = -p * log(p) -> dH/dp = -log(p) - 1
@@ -332,7 +382,7 @@ class fwPKM(Module):
         dp_bar = -log(p_bar, eps = 1e-8) - 1.0
         dp_bar = dp_bar * weights
 
-        dprobs = repeat(dp_bar, 'two h k -> two b n h k', b = b, n = n) / (b * n)
+        dprobs = repeat(dp_bar, 'two b h k -> two b n h k', n = seq_len) / seq_len
 
         dmask = probs * (dprobs - (probs * dprobs).sum(dim = -1, keepdim = True))
         dscore = torch.zeros_like(score_tgt).scatter_(-1, indices, dmask.gather(-1, indices))
@@ -369,14 +419,23 @@ class fwPKM(Module):
 
         # unify backwards tracking onto the queries and keys -> directly yields negative gradient to ADD to keys
 
-        diff = einx.subtract('two b n h d, two h m d -> two b n h m d', queries, keys)
+        diff = einx.subtract('two b n h d, two b h m d -> two b n h m d', queries, keys)
         grad = -2 * einx.multiply('... h m, ... h m d -> ... h m d', dist_grad, diff)
-        next_fast_weight_keys = einx.sum('two b n h m d -> two h m d', grad)
+        next_fast_weight_keys = einx.sum('two b n h m d -> two b h m d', grad)
 
-        # accumulate on top of old memories
+        # accumulate on top of old memories (fast weights are per batch element)
+        # gdn - only the selected slots are decayed, unselected slots remain unchanged (sparse delta memory)
 
         if exists(past_memories):
-            next_fast_weight_memories = next_fast_weight_memories + past_memories.memory_values
+            if self.use_gdn_update:
+                past_selected = rearrange(past_fast_memories, 'b n h k d -> b (n k) h d')
+
+                forgotten_past = torch.zeros(batch, *self.memories.shape, device = self.device).scatter_reduce_(1, final_indices_expanded, einx.multiply('b h, b g h d -> b g h d', 1. - forget_gate, past_selected), reduce = 'mean', include_self = False)
+
+                next_fast_weight_memories = next_fast_weight_memories + past_memories.memory_values - forgotten_past
+            else:
+                next_fast_weight_memories = next_fast_weight_memories + past_memories.memory_values
+
             next_fast_weight_keys = next_fast_weight_keys + past_memories.keys
 
         if detach_next_memories:
@@ -393,19 +452,22 @@ class fwPKM(Module):
         detach_next_memories_every: int | None = None,
         idw_eps = 1e-3
     ):
-        past_mem = default(past_memories, self.init_memories)
-        num_tokens, count, chunk_size = tokens.shape[1], past_mem.token_count, self.chunk_size
+        batch = tokens.shape[0]
+        seq_len = tokens.shape[1]
 
-        if num_tokens == 0:
+        past_mem = default(past_memories, self.init_memories(batch))
+        count, chunk_size = past_mem.token_count, self.chunk_size
+
+        if seq_len == 0:
             return (tokens, past_mem) if return_next_memories else tokens
 
         # calc segments reaching chunk boundaries
 
         to_bound = chunk_size - (count % chunk_size)
-        remainder = max(0, num_tokens - to_bound)
+        remainder = max(0, seq_len - to_bound)
         num_chunks, chunk_remainder = divmod(remainder, chunk_size)
 
-        split_sizes = (min(num_tokens, to_bound), *([chunk_size] * num_chunks), chunk_remainder)
+        split_sizes = (min(seq_len, to_bound), *([chunk_size] * num_chunks), chunk_remainder)
         segments = tokens.split(list(filter(is_greater_than_zero, split_sizes)), dim = 1)
 
         out_list = []
@@ -430,6 +492,8 @@ class fwPKM(Module):
 
             # retrieve outputs
 
+            segment_len = segment.shape[1]
+
             out, inter = self.retrieve(
                 safe_cat((past_mem.last_token, segment), dim = 1),
                 past_memories = past_mem,
@@ -442,7 +506,7 @@ class fwPKM(Module):
 
             # handle causal chaining and slicing
 
-            indices, scores, slen = inter['final_indices'], inter['final_scores'], segment.shape[1]
+            indices, scores, slen = inter['final_indices'], inter['final_scores'], segment_len
 
             if exists(past_mem.last_token):
                 out, indices, scores = [remove_first_token(t) for t in (out, indices, scores)]
